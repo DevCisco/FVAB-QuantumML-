@@ -2,7 +2,7 @@ import numpy as np
 from qiskit import QuantumCircuit
 from qiskit.circuit import ParameterVector
 # FIX #1: RealAmplitudes è una classe, non una funzione — nome corretto con maiuscole
-from qiskit.circuit.library import RealAmplitudes
+from qiskit.circuit.library import real_amplitudes
 
 class QuantumPipeline:
     def __init__(self, n_qubits, d_latent, n_layers=1):
@@ -17,7 +17,7 @@ class QuantumPipeline:
         
         # FIX #1 applicato: RealAmplitudes (classe) al posto di real_amplitudes (funzione inesistente)
         # Usiamo un ansatz "template" solo per ricavare num_parameters
-        _ansatz_template = RealAmplitudes(num_qubits=n_qubits, reps=n_layers, entanglement='linear')
+        _ansatz_template = real_amplitudes(num_qubits=n_qubits, reps=n_layers, entanglement='linear')
         self.n_weights_per_cycle = _ansatz_template.num_parameters
 
         # FIX #6: ogni ciclo di re-uploading deve avere i PROPRI pesi distinti.
@@ -28,7 +28,7 @@ class QuantumPipeline:
         self.weights_list = []
         for k in range(self.re_upload_cycles):
             w = ParameterVector(f"theta_c{k}", self.n_weights_per_cycle)
-            a = RealAmplitudes(num_qubits=n_qubits, reps=n_layers, entanglement='linear')
+            a = real_amplitudes(num_qubits=n_qubits, reps=n_layers, entanglement='linear')
             self.weights_list.append(w)
             self.ansatz_list.append(a)
 

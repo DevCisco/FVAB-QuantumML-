@@ -1,6 +1,5 @@
 from qiskit.circuit import QuantumCircuit, ParameterVector, Parameter
-from qiskit.circuit.library import RealAmplitudes
-
+from qiskit.circuit.library import real_amplitudes
 def create_vqc_circuit(n_qubits, d_latent, reps=1):
     circuit = QuantumCircuit(n_qubits)
     x = ParameterVector('x', d_latent)
@@ -20,7 +19,7 @@ def create_vqc_circuit(n_qubits, d_latent, reps=1):
         # RealAmplitudes con entanglement='linear' ha esattamente
         # n_qubits * (reps + 1) parametri. Usiamo l'attributo reale del circuito
         # per non dipendere da nessuna formula manuale.
-        ansatz_template = RealAmplitudes(n_qubits, reps=reps, entanglement='linear',
+        ansatz_template = real_amplitudes(n_qubits, reps=reps, entanglement='linear',
                                          insert_barriers=True)
         num_ansatz_params = ansatz_template.num_parameters  # valore esatto, non stimato
 
