@@ -62,11 +62,11 @@ Segui quest'ordine per riprodurre gli esperimenti e generare gli artefatti usati
      - artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv
          (feature PCA d-dim in CSV, colonne feat_0..feat_{d-1}, label)
 
-3) Addestramento VQC di produzione (QN‑SPSA)
+3) Addestramento VQC di produzione (NFT)
 
    python train_vqc_production.py
 
-   Cosa fa: esegue un insieme di run (per i valori `DIMS` e `SEEDS` definiti nello script), lancia più worker in parallelo, costruisce `HybridModel` (ResNet → PCA → VQC) e ottimizza i pesi variazionali con QN‑SPSA.
+   Cosa fa: esegue un insieme di run (per i valori `DIMS` e `SEEDS` definiti nello script), lancia più worker in parallelo, costruisce `HybridModel` (ResNet → PCA → VQC) e ottimizza i pesi variazionali con NFT (Nakanishi-Fujii-Todo).
 
    Output principali:
      - experiments/logs/worker_d{d}_s{seed}.log
