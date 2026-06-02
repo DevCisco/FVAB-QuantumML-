@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
-# Obbligatorio su Windows come PRIMA istruzione eseguibile del modulo:
-# impedisce che i worker figli rilancino main() ricorsivamente.
-# Deve precedere qualsiasi import che usi multiprocessing internamente.
+# FIX #9: freeze_support e import come PRIME istruzioni — nessun effetto
+# collaterale a livello di modulo (os.makedirs era a riga 37 nel vecchio file,
+# eseguito anche nei worker spawn durante l'import).
 # ---------------------------------------------------------------------------
 import multiprocessing
 multiprocessing.freeze_support()
@@ -10,18 +10,17 @@ import logging
 import os
 import time
 import traceback
-import threading
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from sklearn.metrics import f1_score as sk_f1
 from torch.utils.data import DataLoader, Subset
 
 from hybrid_engine import HybridModel
 from data_loader import get_data_loaders
-
 # ---------------------------------------------------------------------------
 # NFT — Nakanishi-Fujii-Todo optimizer
 # ---------------------------------------------------------------------------
@@ -33,22 +32,29 @@ from data_loader import get_data_loaders
 #
 # Non richiede fidelity, SamplerV2 né ComputeUncompute — elimina
 # le dipendenze da API Qiskit instabili tra versioni.
-#
-# Con il nuovo HybridModel (DirectVQC + classifier lineare):
-#   - qweights: 16 parametri (RealAmplitudes n_layers=3, n_qubits=4)
-#   - classifier: 4*4+4 = 20 parametri
-#   - totale ottimizzabile: 36 parametri
-#   - eval per sweep NFT: 36 parametri × ~3 eval = ~108 eval/epoca
-#   - con MAX_EVALS_NFT=300: ~2-3 sweep completi per epoca
 from qiskit_algorithms.optimizers import NFT
 
 
 # ---------------------------------------------------------------------------
-# Logging su file — ogni worker scrive su file separato
+# Costanti globali
 # ---------------------------------------------------------------------------
-os.makedirs("experiments/logs", exist_ok=True)
+DIMS          = [32, 16, 8, 4]
+SEEDS         = [11, 17, 29]
+BACKBONE      = 'resnet'
+EPOCHS        = 10          # aumentato: early stopping gestisce la convergenza
+PATIENCE      = 3           # epoche senza miglioramento macro-F1 → stop anticipato
+MAX_EVALS_NFT = 300         # valutazioni NFT per epoca
+MAX_WORKERS   = 4
+
+N_CLASSES         = 4
+N_QUBITS          = N_CLASSES
+SAMPLES_PER_CLASS = 8
+
+JOB_TIMEOUT_SEC = 8 * 3600
+
 
 def get_logger(d: int, seed: int) -> logging.Logger:
+    os.makedirs("experiments/logs", exist_ok=True)   # solo quando serve
     name   = f"worker_d{d}_s{seed}"
     logger = logging.getLogger(name)
     if logger.handlers:
@@ -63,31 +69,7 @@ def get_logger(d: int, seed: int) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# Costanti globali
-# ---------------------------------------------------------------------------
-DIMS          = [32, 16, 8, 4]
-SEEDS         = [11, 17, 29]
-BACKBONE      = 'resnet'
-EPOCHS        = 5
-
-# NFT non usa maxiter ma valutazioni totali della funzione obiettivo.
-# Con 36 parametri: 1 sweep = ~108 eval → MAX_EVALS_NFT=300 ≈ ~2-3 sweep/epoca.
-MAX_EVALS_NFT = 300
-
-MAX_WORKERS   = 4
-
-N_CLASSES         = 4
-N_QUBITS          = N_CLASSES
-SAMPLES_PER_CLASS = 8
-
-JOB_TIMEOUT_SEC = 8 * 3600
-
-# Lock per scrittura CSV condiviso — protegge da race condition con MAX_WORKERS > 1
-_csv_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------------
-# Estrazione label dal loader — robusto a qualsiasi wrapper dataset
+# Estrazione label dal loader
 # ---------------------------------------------------------------------------
 def extract_labels_from_loader(loader: DataLoader) -> np.ndarray:
     all_labels = []
@@ -109,8 +91,7 @@ def make_balanced_subset(
         cls_indices = np.where(all_labels == cls)[0]
         if len(cls_indices) == 0:
             raise ValueError(
-                f"Classe {cls} assente nel dataset. "
-                f"Classi presenti: {np.unique(all_labels).tolist()}"
+                f"Classe {cls} assente. Presenti: {np.unique(all_labels).tolist()}"
             )
         replace = len(cls_indices) < samples_per_class
         chosen  = rng.choice(cls_indices, size=samples_per_class, replace=replace)
@@ -130,36 +111,85 @@ def make_balanced_loader(
 
 
 # ---------------------------------------------------------------------------
-# Pesi per classe
+# Class weights inversamente proporzionali alla frequenza — utile con 8 campioni/classe
+# L'obiettivo è penalizzare di più le classi meno rappresentate, bilanciando la loss
 # ---------------------------------------------------------------------------
 def compute_class_weights(all_labels: np.ndarray) -> torch.Tensor:
     counts  = np.bincount(all_labels, minlength=N_CLASSES).astype(float)
-    weights = 1.0 / (counts + 1e-8)
-    weights = weights / weights.mean()
+    weights = len(all_labels) / (N_CLASSES * (counts + 1e-8))
     return torch.tensor(weights, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation su feature pre-calcolate — macro-F1, per-class F1, accuracy
 # ---------------------------------------------------------------------------
-def evaluate(model, loader, criterion, device):
+def evaluate_on_features(
+    model,
+    u_scaled: torch.Tensor,
+    labels_np: np.ndarray,
+    criterion,
+    device,
+) -> tuple:
+    """
+    Valuta il modello su feature già compresse e scalate.
+
+    Non ri-esegue il backbone — opera su u_scaled pre-calcolato.
+    Restituisce: test_loss, test_acc, macro_f1, per_class_f1.
+
+    macro-F1 è la metrica principale: più informativo dell'accuracy
+    con classi sbilanciate e dataset piccoli (8 campioni/classe).
+    """
     model.eval()
-    correct, total, val_loss = 0, 0, 0.0
+    labels_t = torch.tensor(labels_np, dtype=torch.long, device=device)
     with torch.no_grad():
-        for images, labels in loader:
-            images  = images.to(device)
-            labels  = labels.squeeze().long().to(device)
-            outputs = model(images)
-            loss    = criterion(outputs, labels)
-            val_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            total   += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    return val_loss / len(loader), 100 * correct / total
+        q_out   = model.vqc(u_scaled)
+        outputs = model.classifier(q_out)
+        loss    = criterion(outputs, labels_t)
+        preds   = torch.argmax(outputs, dim=1).cpu().numpy()
+
+    acc          = float((preds == labels_np).mean() * 100)
+    macro_f1     = float(sk_f1(labels_np, preds, average='macro',    zero_division=0))
+    per_class_f1 = sk_f1(labels_np, preds, average=None, zero_division=0).tolist()
+
+    return loss.item(), acc, macro_f1, per_class_f1
 
 
 # ---------------------------------------------------------------------------
-# Bridge NFT ↔ PyTorch — solo parametri trainabili
+# Pre-calcolo feature compresse — PRINCIPALE OTTIMIZZAZIONE DI VELOCITÀ
+#
+# Il backbone ResNet18 (~11.2M param, congelato) veniva chiamato dentro
+# la loss_fn di NFT → 300 volte/epoca × 5 epoche = 1500 chiamate/job.
+# Pre-calcolando una volta, scende a 1 chiamata/job.
+# Riduzione stimata: 80-90% del tempo per epoca.
+#
+# Accede a model._compress() e model.scale_features() — metodi di HybridModel.
+# In Python non esistono metodi veramente privati: l'underscore è solo
+# una convenzione, l'accesso diretto è legale e intenzionale qui.
+# ---------------------------------------------------------------------------
+def precompute_features(
+    model, loader: DataLoader, device
+) -> tuple:
+    """
+    Estrae feature per tutti i campioni del loader con una sola passata backbone.
+
+    Returns:
+        u_scaled  (Tensor): feature scalate in [0, π], shape (N, n_encoding)
+        labels_np (ndarray): label corrispondenti, shape (N,)
+    """
+    all_u, all_labels = [], []
+    with torch.no_grad():
+        for imgs, lbls in loader:
+            u = model.scale_features(model._compress(imgs.to(device)))
+            all_u.append(u.cpu())
+            all_labels.append(lbls.squeeze().long().numpy())
+    return (
+        torch.cat(all_u, dim=0).to(device),
+        np.concatenate(all_labels),
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Bridge NFT ↔ PyTorch — torch.from_numpy + copy_
 # ---------------------------------------------------------------------------
 def get_trainable_params(model) -> np.ndarray:
     params = [
@@ -169,38 +199,45 @@ def get_trainable_params(model) -> np.ndarray:
     ]
     if not params:
         raise RuntimeError(
-            "Nessun parametro con requires_grad=True. "
-            "Il backbone non è stato congelato correttamente in HybridModel."
+            "Nessun parametro trainable. "
+            "Backbone non congelato correttamente in HybridModel."
         )
     return np.concatenate(params)
 
 
 def set_trainable_params(model, flat_params: np.ndarray) -> None:
+    # torch.from_numpy: zero-copy (condivide il buffer numpy)
+    # copy_: scrive in-place, no allocazione extra
+    flat_t = torch.from_numpy(flat_params).float()
     offset = 0
     with torch.no_grad():
         for p in model.parameters():
             if not p.requires_grad:
                 continue
             numel = p.numel()
-            p.copy_(
-                torch.tensor(
-                    flat_params[offset:offset + numel], dtype=p.dtype
-                ).reshape(p.shape)
-            )
+            p.copy_(flat_t[offset:offset + numel].reshape(p.shape))
             offset += numel
 
 
-def make_loss_fn(model, images, labels, criterion):
+def make_loss_fn_fast(
+    model,
+    u_scaled: torch.Tensor,
+    labels_t: torch.Tensor,
+    criterion,
+):
     """
-    Closure NFT-compatibile (stessa firma: callable(params: np.ndarray) → float).
-    NaN/Inf dalla simulazione → restituisce 1e6 invece di propagare.
+    Closure NFT-compatibile su feature pre-calcolate.
+
+    Chiama solo model.vqc + model.classifier — salta completamente il backbone.
+    È la differenza tra 300 forward ResNet18/epoca e 0.
     """
     def loss_fn(params: np.ndarray) -> float:
         set_trainable_params(model, params)
         model.train()
         with torch.no_grad():
-            outputs = model(images)
-            loss    = criterion(outputs, labels)
+            q_out   = model.vqc(u_scaled)
+            outputs = model.classifier(q_out)
+            loss    = criterion(outputs, labels_t)
         val = float(loss.item())
         return val if np.isfinite(val) else 1e6
     return loss_fn
@@ -214,16 +251,17 @@ def safe_result_fun(result) -> float:
     return val if np.isfinite(val) else float('nan')
 
 
-
-
-
-# ---------------------------------------------------------------------------
-# Scrittura CSV thread-safe
-# ---------------------------------------------------------------------------
-def append_to_csv(log_file: str, df: pd.DataFrame) -> None:
-    with _csv_lock:
-        header = not os.path.exists(log_file)
-        df.to_csv(log_file, mode='a', header=header, index=False)
+def save_worker_csv(history: list, d: int, seed: int) -> None:
+    os.makedirs("experiments/history", exist_ok=True)
+    path = f"experiments/history/log_d{d}_s{seed}.csv"
+    pd.DataFrame(
+        history,
+        columns=[
+            'epoch', 'd', 'seed', 'backbone',
+            'train_loss', 'test_loss', 'test_acc',
+            'macro_f1', 'per_class_f1',
+        ],
+    ).to_csv(path, index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -237,25 +275,25 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
 
     device = torch.device("cpu")
     logger = get_logger(d, seed)
-    logger.info(f"Avvio worker d={d} seed={seed} backbone={backbone}")
+    logger.info(f"Avvio job d={d} seed={seed} backbone={backbone}")
 
     # — Dati -----------------------------------------------------------------
     try:
-        train_loader_full, val_loader, _ = get_data_loaders(
+        train_loader_full, _, test_loader = get_data_loaders(
             seed=seed, batch_size=32
         )
     except Exception:
-        logger.error(f"Errore get_data_loaders:\n{traceback.format_exc()}")
+        logger.error(traceback.format_exc())
         raise
 
     try:
         train_labels = extract_labels_from_loader(train_loader_full)
         logger.info(
-            f"Label estratte: {len(train_labels)} campioni | "
+            f"Campioni train: {len(train_labels)} | "
             f"classi: {np.unique(train_labels).tolist()}"
         )
     except Exception:
-        logger.error(f"Errore estrazione label:\n{traceback.format_exc()}")
+        logger.error(traceback.format_exc())
         raise
 
     try:
@@ -268,7 +306,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
             seed=seed,
         )
     except Exception:
-        logger.error(f"Errore preparazione dataset:\n{traceback.format_exc()}")
+        logger.error(traceback.format_exc())
         raise
 
     # — Modello --------------------------------------------------------------
@@ -278,130 +316,169 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
             backbone_type=backbone,
         ).to(device)
     except Exception:
-        logger.error(f"Errore HybridModel init:\n{traceback.format_exc()}")
+        logger.error(traceback.format_exc())
         raise
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Parametri ottimizzabili (VQC): {n_trainable}")
-    print(f"[d={d} s={seed}] parametri ottimizzabili: {n_trainable}", flush=True)
+    logger.info(f"Parametri trainabili: {n_trainable}")
+    print(f"[d={d} s={seed}] parametri trainabili: {n_trainable}", flush=True)
 
-    # — NFT (Nakanishi-Fujii-Todo) -------------------------------------------
-    # NFT ottimizza un parametro alla volta sfruttando la struttura sinusoidale
-    # esatta dei gate RY in RealAmplitudes — nessuna stima di gradiente,
-    # nessuna fidelity, nessuna dipendenza da SamplerV2 o AerSimulator.
-    #
-    # Con 36 parametri ottimizzabili (16 qweights + 20 classifier):
-    #   1 sweep = ~108 valutazioni (36 param × 3 eval/param)
-    #   MAX_EVALS_NFT=300 → ~2-3 sweep completi per epoca
+    # — Pre-calcolo feature (UNA VOLTA per job) ------------------------------
+    # Il backbone viene chiamato qui e MAI più nel loop NFT.
+    # Risparmio stimato: 300 forward ResNet18/epoca → 1 forward/job.
+    try:
+        u_train_scaled, train_labels_np = precompute_features(
+            model, balanced_loader, device
+        )
+        u_test_scaled, test_labels_np = precompute_features(
+            model, test_loader, device
+        )
+        train_labels_t = torch.tensor(
+            train_labels_np, dtype=torch.long, device=device
+        )
+        logger.info(
+            f"Feature pre-calcolate: "
+            f"train {u_train_scaled.shape} | test {u_test_scaled.shape}"
+        )
+        print(
+            f"[d={d} s={seed}] feature calcolate: "
+            f"train {tuple(u_train_scaled.shape)} | test {tuple(u_test_scaled.shape)}",
+            flush=True,
+        )
+    except Exception:
+        logger.error(f"Errore pre-calcolo feature:\n{traceback.format_exc()}")
+        raise
+
+    # — NFT ------------------------------------------------------------------
     optimizer = NFT(maxfev=MAX_EVALS_NFT)
 
-    best_val_acc = 0.0
-    best_loss    = float('inf')
-    history      = []
+    best_macro_f1 = 0.0
+    best_loss     = float('inf')
+    patience_ctr  = 0          # FIX #6: contatore early stopping
+    history       = []
     os.makedirs("experiments/models", exist_ok=True)
 
     print(
-        f">>> Inizio NFT: {backbone.upper()} + VQC | "
-        f"d={d} seed={seed} | maxfev={MAX_EVALS_NFT}",
+        f">>> NFT: {backbone.upper()} | d={d} seed={seed} | "
+        f"maxfev={MAX_EVALS_NFT} | patience={PATIENCE}",
         flush=True,
     )
-    logger.info(f"Inizio training loop NFT maxfev={MAX_EVALS_NFT}")
+    logger.info(f"Inizio training NFT maxfev={MAX_EVALS_NFT} patience={PATIENCE}")
 
     for epoch in range(EPOCHS):
         t0 = time.time()
 
         try:
-            images, labels_batch = next(iter(balanced_loader))
-            images       = images.to(device)
-            labels_batch = labels_batch.squeeze().long().to(device)
-
-            loss_fn = make_loss_fn(model, images, labels_batch, criterion)
-            x0      = get_trainable_params(model)
-
-            # NFT.minimize: stessa firma callable (params: np.ndarray) → float
-            result  = optimizer.minimize(fun=loss_fn, x0=x0)
+            # loss_fn opera su feature pre-calcolate — backbone escluso
+            loss_fn = make_loss_fn_fast(
+                model, u_train_scaled, train_labels_t, criterion
+            )
+            result  = optimizer.minimize(fun=loss_fn, x0=get_trainable_params(model))
             set_trainable_params(model, result.x)
 
-            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            # valutazione su test_loader — macro-F1 prima della loss (FIX #4)
+            # per_class_f1 loggato per diagnosticare classi problematiche (FIX #10)
+            test_loss, test_acc, macro_f1, per_class_f1 = evaluate_on_features(
+                model, u_test_scaled, test_labels_np, criterion, device
+            )
 
         except Exception:
-            logger.error(f"Epoch {epoch+1} fallita:\n{traceback.format_exc()}")
+            logger.error(f"Epoch {epoch+1}:\n{traceback.format_exc()}")
             print(
-                f"[WARN] d={d} seed={seed} | Epoch {epoch+1} fallita — continuo",
+                f"[WARN] d={d} s={seed} | Epoch {epoch+1} fallita — continuo",
                 flush=True,
             )
-            history.append(
-                [epoch + 1, d, seed, backbone, float('nan'), float('nan')]
-            )
+            history.append([
+                epoch+1, d, seed, backbone,
+                float('nan'), float('nan'), float('nan'), float('nan'), '[]',
+            ])
+            patience_ctr += 1
+            if patience_ctr >= PATIENCE:
+                break
             continue
 
         train_loss = safe_result_fun(result)
         elapsed    = time.time() - t0
 
-        logger.info(
-            f"Epoch {epoch+1}/{EPOCHS} | Loss={train_loss:.4f} | "
-            f"ValAcc={val_acc:.2f}% | t={elapsed:.1f}s"
+        # Stampa: macro-F1 prima, poi loss, poi per-class F1
+        log_msg = (
+            f"Epoch {epoch+1}/{EPOCHS} | "
+            f"macro-F1: {macro_f1:.4f} | "
+            f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}% | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"per-class F1: {[f'{v:.3f}' for v in per_class_f1]} | "
+            f"t={elapsed:.1f}s"
         )
-        print(
-            f"d={d} seed={seed} | Epoch {epoch+1}/{EPOCHS} | "
-            f"Loss: {train_loss:.4f} | Val Acc: {val_acc:.2f}% | "
-            f"Time: {elapsed:.1f}s",
-            flush=True,
-        )
+        logger.info(log_msg)
+        print(f"d={d} s={seed} | {log_msg}", flush=True)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_loss    = train_loss
-            ckpt_path    = (
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
+            best_loss     = train_loss
+            patience_ctr  = 0
+            ckpt_path = (
                 f"experiments/models/best_vqc_{backbone}_d{d}_seed{seed}.pth"
             )
             try:
-                # weights_only implicito nel salvataggio (non nel caricamento):
-                # torch.save non ha weights_only, il flag è solo per torch.load.
                 torch.save(model.state_dict(), ckpt_path)
-                logger.info(f"Checkpoint salvato: {ckpt_path}")
+                logger.info(f"Checkpoint → {ckpt_path} (macro-F1={macro_f1:.4f})")
             except Exception:
-                logger.error(
-                    f"Errore salvataggio checkpoint:\n{traceback.format_exc()}"
+                logger.error(f"Errore checkpoint:\n{traceback.format_exc()}")
+        else:
+            patience_ctr += 1
+            logger.info(f"No improvement: {patience_ctr}/{PATIENCE}")
+            if patience_ctr >= PATIENCE:
+                logger.info(f"Early stopping a epoch {epoch+1}")
+                print(
+                    f"[STOP] d={d} s={seed} | "
+                    f"Early stopping a epoch {epoch+1} (patience={PATIENCE})",
+                    flush=True,
                 )
+                history.append([
+                    epoch+1, d, seed, backbone,
+                    train_loss, test_loss, test_acc, macro_f1,
+                    str([f'{v:.3f}' for v in per_class_f1]),
+                ])
+                break
 
-        history.append([epoch + 1, d, seed, backbone, train_loss, val_acc])
+        history.append([
+            epoch+1, d, seed, backbone,
+            train_loss, test_loss, test_acc, macro_f1,
+            str([f'{v:.3f}' for v in per_class_f1]),
+        ])
 
-    # — Log CSV thread-safe --------------------------------------------------
-    log_file = "experiments/production_log.csv"
-    os.makedirs("experiments", exist_ok=True)
     try:
-        df_h = pd.DataFrame(
-            history,
-            columns=['epoch', 'd', 'seed', 'backbone', 'loss', 'val_acc'],
-        )
-        append_to_csv(log_file, df_h)
+        save_worker_csv(history, d, seed)
     except Exception:
-        logger.error(f"Errore scrittura CSV:\n{traceback.format_exc()}")
+        logger.error(f"Errore CSV:\n{traceback.format_exc()}")
 
-    logger.info(f"Completato. Best Val Acc: {best_val_acc:.2f}%")
-    print(
-        f"[OK] d={d} seed={seed} → Best Val Acc: {best_val_acc:.2f}%",
-        flush=True,
-    )
+    logger.info(f"Completato. Best macro-F1: {best_macro_f1:.4f}")
+    print(f"[OK] d={d} s={seed} → Best macro-F1: {best_macro_f1:.4f}", flush=True)
     return {
-        "d": d, "seed": seed, "backbone": backbone,
-        "best_loss": best_loss, "best_val_acc": best_val_acc,
+        "d":            d,
+        "seed":         seed,
+        "backbone":     backbone,
+        "best_loss":    best_loss,
+        "best_macro_f1": best_macro_f1,
     }
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point — parallelizzazione Windows-safe
 # ---------------------------------------------------------------------------
 def main():
-    os.makedirs("experiments/models", exist_ok=True)
-    os.makedirs("experiments/logs",   exist_ok=True)
-    os.makedirs("experiments",        exist_ok=True)
+    os.makedirs("experiments/models",  exist_ok=True)
+    os.makedirs("experiments/logs",    exist_ok=True)
+    os.makedirs("experiments/history", exist_ok=True)
+    os.makedirs("experiments",         exist_ok=True)
 
     jobs = [(d, s, BACKBONE) for d in DIMS for s in SEEDS]
 
-    print(f"[INFO] Avvio {len(jobs)} run su {MAX_WORKERS} processi paralleli...")
-    print(f"[INFO] Ottimizzatore: NFT | maxfev={MAX_EVALS_NFT} per epoca")
+    print(f"[INFO] Avvio {len(jobs)} job su {MAX_WORKERS} processi paralleli...")
+    print(
+        f"[INFO] NFT | maxfev={MAX_EVALS_NFT} | "
+        f"epochs={EPOCHS} | patience={PATIENCE}"
+    )
     print(f"[INFO] Log per worker in experiments/logs/\n")
 
     all_results = []
@@ -417,35 +494,49 @@ def main():
                 result = future.result(timeout=JOB_TIMEOUT_SEC)
                 all_results.append(result)
                 print(
-                    f"[DONE] d={d} seed={s} → "
-                    f"Best Val Acc: {result['best_val_acc']:.2f}%",
+                    f"[DONE] d={d} s={s} → "
+                    f"macro-F1: {result['best_macro_f1']:.4f} | "
+                    f"loss: {result['best_loss']:.4f}",
                     flush=True,
                 )
             except TimeoutError:
                 print(
-                    f"[TIMEOUT] d={d} seed={s} → "
-                    f"superato limite {JOB_TIMEOUT_SEC // 3600}h — job annullato",
+                    f"[TIMEOUT] d={d} s={s} → "
+                    f"limite {JOB_TIMEOUT_SEC // 3600}h superato",
                     flush=True,
                 )
             except Exception:
                 print(
-                    f"[ERROR] d={d} seed={s} →\n{traceback.format_exc()}",
+                    f"[ERROR] d={d} s={s} →\n{traceback.format_exc()}",
                     flush=True,
                 )
 
     if all_results:
         df = pd.DataFrame(all_results)
-        df = df[['d', 'seed', 'backbone', 'best_loss', 'best_val_acc']]
+        df = df[['d', 'seed', 'backbone', 'best_loss', 'best_macro_f1']]
         df = df.sort_values(
             ["d", "seed"], ascending=[False, True]
         ).reset_index(drop=True)
         df.to_csv("experiments/production_summary.csv", index=False)
+
+        # Merge CSV per-worker in un unico log finale
+        history_files = [
+            f"experiments/history/log_d{d}_s{s}.csv"
+            for d, s, _ in jobs
+            if os.path.exists(f"experiments/history/log_d{d}_s{s}.csv")
+        ]
+        if history_files:
+            pd.concat(
+                [pd.read_csv(f) for f in history_files], ignore_index=True
+            ).to_csv("experiments/production_log.csv", index=False)
+            print(f"[INFO] Log unificato → experiments/production_log.csv")
+
         print("\n[DONE] Training NFT completato.")
         print(df.to_string(index=False))
     else:
         print(
-            "\n[WARNING] Nessun risultato: tutti i job sono falliti. "
-            "Controllare experiments/logs/ per i traceback completi."
+            "\n[WARNING] Nessun risultato. "
+            "Controllare experiments/logs/ per i traceback."
         )
 
 
