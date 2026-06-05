@@ -258,8 +258,10 @@ def save_worker_csv(history: list, d: int, seed: int) -> None:
         history,
         columns=[
             'epoch', 'd', 'seed', 'backbone',
-            'train_loss', 'test_loss', 'test_acc',
-            'macro_f1', 'per_class_f1',
+            'train_loss',
+            'val_loss', 'val_acc', 'val_macro_f1',
+            'test_loss', 'test_acc', 'test_macro_f1',
+            'per_class_f1',
         ],
     ).to_csv(path, index=False)
 
@@ -279,7 +281,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
 
     # — Dati -----------------------------------------------------------------
     try:
-        train_loader_full, _, test_loader = get_data_loaders(
+        train_loader_full, val_loader, test_loader = get_data_loaders(
             seed=seed, batch_size=32
         )
     except Exception:
@@ -330,6 +332,9 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         u_train_scaled, train_labels_np = precompute_features(
             model, balanced_loader, device
         )
+        u_val_scaled, val_labels_np = precompute_features(
+            model, val_loader, device
+        )
         u_test_scaled, test_labels_np = precompute_features(
             model, test_loader, device
         )
@@ -338,11 +343,11 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         )
         logger.info(
             f"Feature pre-calcolate: "
-            f"train {u_train_scaled.shape} | test {u_test_scaled.shape}"
+            f"train {u_train_scaled.shape} | val {u_val_scaled.shape} | test {u_test_scaled.shape}"
         )
         print(
             f"[d={d} s={seed}] feature calcolate: "
-            f"train {tuple(u_train_scaled.shape)} | test {tuple(u_test_scaled.shape)}",
+            f"train {tuple(u_train_scaled.shape)} | val {tuple(u_val_scaled.shape)} | test {tuple(u_test_scaled.shape)}",
             flush=True,
         )
     except Exception:
@@ -352,9 +357,10 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     # — NFT ------------------------------------------------------------------
     optimizer = NFT(maxfev=MAX_EVALS_NFT)
 
-    best_macro_f1 = 0.0
-    best_loss     = float('inf')
-    patience_ctr  = 0          # FIX #6: contatore early stopping
+    best_macro_f1     = 0.0
+    best_val_macro_f1 = 0.0
+    best_loss         = float('inf')
+    patience_ctr      = 0          # contatore early stopping
     history       = []
     os.makedirs("experiments/models", exist_ok=True)
 
@@ -376,8 +382,11 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
             result  = optimizer.minimize(fun=loss_fn, x0=get_trainable_params(model))
             set_trainable_params(model, result.x)
 
-            # valutazione su test_loader — macro-F1 prima della loss (FIX #4)
-            # per_class_f1 loggato per diagnosticare classi problematiche (FIX #10)
+            # valutazione su val e test — macro-F1 prima della loss
+            # per_class_f1 loggato per diagnosticare classi problematiche
+            val_loss, val_acc, val_macro_f1, _ = evaluate_on_features(
+                model, u_val_scaled, val_labels_np, criterion, device
+            )
             test_loss, test_acc, macro_f1, per_class_f1 = evaluate_on_features(
                 model, u_test_scaled, test_labels_np, criterion, device
             )
@@ -390,7 +399,9 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
             )
             history.append([
                 epoch+1, d, seed, backbone,
-                float('nan'), float('nan'), float('nan'), float('nan'), '[]',
+                float('nan'),
+                float('nan'), float('nan'), float('nan'),
+                float('nan'), float('nan'), float('nan'), '[]',
             ])
             patience_ctr += 1
             if patience_ctr >= PATIENCE:
@@ -400,12 +411,12 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         train_loss = safe_result_fun(result)
         elapsed    = time.time() - t0
 
-        # Stampa: macro-F1 prima, poi loss, poi per-class F1
+        # Stampa: macro-F1 test e val prima della loss, poi per-class F1
         log_msg = (
             f"Epoch {epoch+1}/{EPOCHS} | "
-            f"macro-F1: {macro_f1:.4f} | "
-            f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}% | "
-            f"Train Loss: {train_loss:.4f} | "
+            f"macro-F1 test: {macro_f1:.4f} | macro-F1 val: {val_macro_f1:.4f} | "
+            f"Test Loss: {test_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"Test Acc: {test_acc:.2f}% | Train Loss: {train_loss:.4f} | "
             f"per-class F1: {[f'{v:.3f}' for v in per_class_f1]} | "
             f"t={elapsed:.1f}s"
         )
@@ -413,15 +424,16 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         print(f"d={d} s={seed} | {log_msg}", flush=True)
 
         if macro_f1 > best_macro_f1:
-            best_macro_f1 = macro_f1
-            best_loss     = train_loss
-            patience_ctr  = 0
+            best_macro_f1     = macro_f1
+            best_val_macro_f1 = val_macro_f1
+            best_loss         = train_loss
+            patience_ctr      = 0
             ckpt_path = (
                 f"experiments/models/best_vqc_{backbone}_d{d}_seed{seed}.pth"
             )
             try:
                 torch.save(model.state_dict(), ckpt_path)
-                logger.info(f"Checkpoint → {ckpt_path} (macro-F1={macro_f1:.4f})")
+                logger.info(f"Checkpoint → {ckpt_path} (test F1={macro_f1:.4f} | val F1={val_macro_f1:.4f})")
             except Exception:
                 logger.error(f"Errore checkpoint:\n{traceback.format_exc()}")
         else:
@@ -436,14 +448,18 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
                 )
                 history.append([
                     epoch+1, d, seed, backbone,
-                    train_loss, test_loss, test_acc, macro_f1,
+                    train_loss,
+                    val_loss, val_acc, val_macro_f1,
+                    test_loss, test_acc, macro_f1,
                     str([f'{v:.3f}' for v in per_class_f1]),
                 ])
                 break
 
         history.append([
             epoch+1, d, seed, backbone,
-            train_loss, test_loss, test_acc, macro_f1,
+            train_loss,
+            val_loss, val_acc, val_macro_f1,
+            test_loss, test_acc, macro_f1,
             str([f'{v:.3f}' for v in per_class_f1]),
         ])
 
@@ -452,14 +468,15 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     except Exception:
         logger.error(f"Errore CSV:\n{traceback.format_exc()}")
 
-    logger.info(f"Completato. Best macro-F1: {best_macro_f1:.4f}")
-    print(f"[OK] d={d} s={seed} → Best macro-F1: {best_macro_f1:.4f}", flush=True)
+    logger.info(f"Completato. Best test macro-F1: {best_macro_f1:.4f} | Best val macro-F1: {best_val_macro_f1:.4f}")
+    print(f"[OK] d={d} s={seed} → Test macro-F1: {best_macro_f1:.4f} | Val macro-F1: {best_val_macro_f1:.4f}", flush=True)
     return {
-        "d":            d,
-        "seed":         seed,
-        "backbone":     backbone,
-        "best_loss":    best_loss,
-        "best_macro_f1": best_macro_f1,
+        "d":              d,
+        "seed":           seed,
+        "backbone":       backbone,
+        "best_loss":      best_loss,
+        "best_val_macro_f1": best_val_macro_f1,
+        "best_test_macro_f1": best_macro_f1,
     }
 
 
@@ -495,7 +512,8 @@ def main():
                 all_results.append(result)
                 print(
                     f"[DONE] d={d} s={s} → "
-                    f"macro-F1: {result['best_macro_f1']:.4f} | "
+                    f"test F1: {result['best_test_macro_f1']:.4f} | "
+                    f"val F1: {result['best_val_macro_f1']:.4f} | "
                     f"loss: {result['best_loss']:.4f}",
                     flush=True,
                 )
@@ -513,7 +531,7 @@ def main():
 
     if all_results:
         df = pd.DataFrame(all_results)
-        df = df[['d', 'seed', 'backbone', 'best_loss', 'best_macro_f1']]
+        df = df[['d', 'seed', 'backbone', 'best_loss', 'best_val_macro_f1', 'best_test_macro_f1']]
         df = df.sort_values(
             ["d", "seed"], ascending=[False, True]
         ).reset_index(drop=True)
