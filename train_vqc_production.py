@@ -357,10 +357,10 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     # — NFT ------------------------------------------------------------------
     optimizer = NFT(maxfev=MAX_EVALS_NFT)
 
-    best_macro_f1     = 0.0
-    best_val_macro_f1 = 0.0
-    best_loss         = float('inf')
-    patience_ctr      = 0          # contatore early stopping
+    best_val_macro_f1  = 0.0   # metrica per checkpoint e early stopping
+    best_test_macro_f1 = 0.0   # test F1 all'epoca in cui val era migliore (solo report)
+    best_loss          = float('inf')
+    patience_ctr       = 0     # contatore early stopping
     history       = []
     os.makedirs("experiments/models", exist_ok=True)
 
@@ -423,22 +423,23 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         logger.info(log_msg)
         print(f"d={d} s={seed} | {log_msg}", flush=True)
 
-        if macro_f1 > best_macro_f1:
-            best_macro_f1     = macro_f1
-            best_val_macro_f1 = val_macro_f1
-            best_loss         = train_loss
-            patience_ctr      = 0
+        # checkpoint e early stopping basati SOLO su val — nessuna decisione sul test
+        if val_macro_f1 > best_val_macro_f1:
+            best_val_macro_f1  = val_macro_f1
+            best_test_macro_f1 = macro_f1   # test passivo: registrato, non usato per decidere
+            best_loss          = train_loss
+            patience_ctr       = 0
             ckpt_path = (
                 f"experiments/models/best_vqc_{backbone}_d{d}_seed{seed}.pth"
             )
             try:
                 torch.save(model.state_dict(), ckpt_path)
-                logger.info(f"Checkpoint → {ckpt_path} (test F1={macro_f1:.4f} | val F1={val_macro_f1:.4f})")
+                logger.info(f"Checkpoint → {ckpt_path} (val F1={val_macro_f1:.4f} | test F1={macro_f1:.4f})")
             except Exception:
                 logger.error(f"Errore checkpoint:\n{traceback.format_exc()}")
         else:
             patience_ctr += 1
-            logger.info(f"No improvement: {patience_ctr}/{PATIENCE}")
+            logger.info(f"No improvement val: {patience_ctr}/{PATIENCE}")
             if patience_ctr >= PATIENCE:
                 logger.info(f"Early stopping a epoch {epoch+1}")
                 print(
@@ -468,15 +469,15 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     except Exception:
         logger.error(f"Errore CSV:\n{traceback.format_exc()}")
 
-    logger.info(f"Completato. Best test macro-F1: {best_macro_f1:.4f} | Best val macro-F1: {best_val_macro_f1:.4f}")
-    print(f"[OK] d={d} s={seed} → Test macro-F1: {best_macro_f1:.4f} | Val macro-F1: {best_val_macro_f1:.4f}", flush=True)
+    logger.info(f"Completato. Best val macro-F1: {best_val_macro_f1:.4f} | Test macro-F1 al miglior val: {best_test_macro_f1:.4f}")
+    print(f"[OK] d={d} s={seed} → Val macro-F1: {best_val_macro_f1:.4f} | Test macro-F1: {best_test_macro_f1:.4f}", flush=True)
     return {
         "d":              d,
         "seed":           seed,
         "backbone":       backbone,
         "best_loss":      best_loss,
-        "best_val_macro_f1": best_val_macro_f1,
-        "best_test_macro_f1": best_macro_f1,
+        "best_val_macro_f1":  best_val_macro_f1,
+        "best_test_macro_f1": best_test_macro_f1,
     }
 
 
@@ -512,8 +513,8 @@ def main():
                 all_results.append(result)
                 print(
                     f"[DONE] d={d} s={s} → "
-                    f"test F1: {result['best_test_macro_f1']:.4f} | "
                     f"val F1: {result['best_val_macro_f1']:.4f} | "
+                    f"test F1 (al miglior val): {result['best_test_macro_f1']:.4f} | "
                     f"loss: {result['best_loss']:.4f}",
                     flush=True,
                 )
