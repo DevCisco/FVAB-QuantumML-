@@ -1,6 +1,8 @@
 # ---------------------------------------------------------------------------
-# CRITICO — Windows spawn: deve essere la PRIMA istruzione eseguibile.
-# Senza freeze_support ogni worker processo ri-lancia main() ricorsivamente.
+# Windows spawn: multiprocessing.freeze_support() viene chiamata come prima
+# istruzione DENTRO main(), subito dopo il guard `if __name__ == "__main__"`.
+# Questo soddisfa il requisito reale di Python (deve precedere qualunque
+# spawn di processo figlio) — non serve essere a livello di modulo.
 # ---------------------------------------------------------------------------
 
 import multiprocessing
@@ -16,7 +18,26 @@ import torch.nn as nn
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.metrics import f1_score as sk_f1
 
-from hybrid_engine import HybridModel
+# ---------------------------------------------------------------------------
+# FIX PRINCIPALE — rimossa la dipendenza da HybridModel.
+#
+# HybridModel.__init__ istanziava SEMPRE un ResNetCompressor completo
+# (~11.2M parametri, caricamento pesi da disco) e rifittava StandardScaler+PCA
+# su 10.000 campioni raw 512-dim, INDIPENDENTEMENTE dal parametro backbone_type
+# passato (che nella classe non viene mai letto nel corpo del costruttore).
+#
+# Nel flusso attuale le feature d-dim arrivano già pronte dai CSV prodotti
+# da test.py — backbone, scaler e PCA di HybridModel non servono a nulla,
+# ma venivano comunque costruiti 12 volte (una per job), sprecando CPU/RAM
+# e gonfiando ogni checkpoint di decine di MB di pesi ResNet mai usati.
+#
+# Fix: si costruiscono direttamente solo i tre componenti realmente
+# necessari — QuantumPipeline (circuito), DirectVQC (layer quantistico),
+# nn.Linear (classifier) — bypassando completamente ResNetCompressor.
+# ---------------------------------------------------------------------------
+from quantum_model import QuantumPipeline
+from hybrid_engine import DirectVQC
+from qiskit_aer.primitives import EstimatorV2
 
 # ---------------------------------------------------------------------------
 # NFT — Nakanishi-Fujii-Todo optimizer
@@ -34,7 +55,9 @@ from qiskit_algorithms.optimizers import NFT
 # ---------------------------------------------------------------------------
 DIMS     = [32, 16, 8, 4]
 SEEDS    = [11, 17, 29]
-BACKBONE = 'pca'
+BACKBONE = 'pca'   # etichetta per file/log — riflette che le feature CSV sono
+                   # già compresse via PCA in test.py, non controlla più nulla
+                   # nella costruzione del modello (vedi nota sopra).
 EPOCHS   = 10
 PATIENCE = 3
 
@@ -42,9 +65,10 @@ MAX_EVALS_NFT = 300
 MAX_WORKERS   = 4
 
 N_CLASSES              = 4
-N_QUBITS               = N_CLASSES
-SAMPLES_PER_CLASS      = 8
-SAMPLES_POOL_PER_CLASS = 64
+N_QUBITS                = N_CLASSES
+N_LAYERS                = 3   # RealAmplitudes reps → 4×(3+1)=16 parametri variazionali
+SAMPLES_PER_CLASS       = 8
+SAMPLES_POOL_PER_CLASS  = 64
 
 # Dimensione batch per la valutazione su val/test set completi.
 # Un singolo forward sull'intero set causa OOM con dataset grandi.
@@ -59,19 +83,14 @@ JOB_TIMEOUT_SEC = 8 * 3600
 # Problema: feature_selector ha d×N_QUBITS parametri — con d=32 i parametri
 # totali (164) sono più del triplo di d=4 (52), ma MAX_EVALS_NFT era fisso
 # a 300 per tutti. Risultato osservato: d=16 (100 param) ottiene esattamente
-# 3.0 sweep completi e converge stabilmente su tutti i seed (test F1
-# 0.852-0.862). d=32 (164 param) ottiene solo 1.8 sweep e fallisce
-# catastroficamente per seed=11 (test F1 0.461) — con meno di 2 sweep,
-# l'ordine in cui NFT visita i parametri diventa determinante per il risultato.
+# 3.0 sweep completi e converge stabilmente su tutti i seed. d=32 (164 param)
+# otteneva solo 1.8 sweep e falliva catastroficamente su alcuni seed — con
+# meno di 2 sweep, l'ordine in cui NFT visita i parametri diventa
+# determinante per il risultato.
 #
 # Fix: scala il budget SOLO quando serve, con un floor a MAX_EVALS_NFT (300).
 # d=4/8/16 restano IDENTICI a prima (nessuna regressione su config già
 # validate). Solo d=32 sale a 492 (+64%, il minimo per garantire 3 sweep).
-#
-# Scelta deliberatamente conservativa per il vincolo hardware
-# (i5-1135G7, 4 core fisici): niente scaling uniforme a 5 sweep per tutti
-# (che avrebbe quasi triplicato il costo anche per d=8/d=16 che già
-# funzionano bene) — solo il minimo indispensabile per d=32.
 NFT_TARGET_SWEEPS = 3   # sweep minimi garantiti — validato empiricamente su d=16
 
 
@@ -88,7 +107,6 @@ def get_max_evals_nft(n_trainable_params: int) -> int:
         maxfev da passare a NFT().
     """
     return max(MAX_EVALS_NFT, n_trainable_params * NFT_TARGET_SWEEPS)
-
 
 
 # ---------------------------------------------------------------------------
@@ -110,14 +128,12 @@ def get_logger(d: int, seed: int) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# MODIFICA PRINCIPALE — Lettura CSV prodotti da test.py
+# Lettura CSV prodotti da test.py
 # ---------------------------------------------------------------------------
 # test.py salva: artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv
 # Colonne: feat_0, feat_1, ..., feat_{d-1}, label
-#
-# Questa funzione sostituisce completamente precompute_features_full() e
-# tutta la pipeline backbone→scaler→PCA che era eseguita a runtime.
 # Le feature d-dim sono già calcolate: basta leggerle e convertirle in tensor.
+# Nessuna dipendenza da file raw 512-dim — eliminata insieme a HybridModel.
 # ---------------------------------------------------------------------------
 def load_features_from_csv(split: str, d: int, seed: int, device) -> tuple:
     """
@@ -193,18 +209,29 @@ def sample_balanced_batch(
         chosen  = rng.choice(cls_idx, size=samples_per_class, replace=replace)
         indices.extend(chosen.tolist())
 
-    # Stessa correzione di make_balanced_pool: LongTensor per indicizzare Tensor.
     idx_t = torch.tensor(indices, dtype=torch.long)
     return u_pool[idx_t], y_pool[np.array(indices)]
 
 
 # ---------------------------------------------------------------------------
-# Pesi per classe
+# Pesi per classe — formula sklearn balanced
 # ---------------------------------------------------------------------------
 def compute_class_weights(all_labels: np.ndarray) -> torch.Tensor:
     counts  = np.bincount(all_labels, minlength=N_CLASSES).astype(float)
     weights = len(all_labels) / (N_CLASSES * (counts + 1e-8))
     return torch.tensor(weights, dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# Scaling feature in [0, π] per i gate RY (angle encoding)
+#
+# Replica esatta dell'ex HybridModel.scale_features, ora standalone perché
+# non dipendiamo più da HybridModel. Pura funzione matematica, nessuno stato.
+# ---------------------------------------------------------------------------
+def scale_features(u: torch.Tensor) -> torch.Tensor:
+    u_min = u.min(dim=1, keepdim=True)[0]
+    u_max = u.max(dim=1, keepdim=True)[0]
+    return (u - u_min) / (u_max - u_min + 1e-8) * np.pi
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +246,7 @@ def get_trainable_params(modules: list) -> np.ndarray:
     if not all_params:
         raise RuntimeError(
             "Nessun parametro trainable. "
-            "Verificare requires_grad e che il backbone sia congelato."
+            "Verificare requires_grad sui moduli (feature_selector, vqc, classifier)."
         )
     return np.concatenate(all_params)
 
@@ -239,6 +266,10 @@ def set_trainable_params(modules: list, flat_params: np.ndarray) -> None:
 
 # ---------------------------------------------------------------------------
 # Closure NFT
+#
+# modules = [feature_selector, vqc, classifier] — tre oggetti separati,
+# non più un singolo HybridModel che li incapsulava insieme a backbone/PCA
+# inutilizzati.
 # ---------------------------------------------------------------------------
 def make_loss_fn(
     modules:  list,
@@ -246,16 +277,18 @@ def make_loss_fn(
     labels_t: torch.Tensor,  # (32,)
     criterion,
 ) -> callable:
+    feature_selector, vqc, classifier = modules
+
     # Closure NFT-compatibile: callable(params: np.ndarray) → float.
     def loss_fn(params: np.ndarray) -> float:
         set_trainable_params(modules, params)
         for module in modules:
             module.train()
         with torch.no_grad():
-            u_4      = modules[0](u_batch)          # feature_selector: d → 4
-            u_scaled = modules[1].scale_features(u_4)
-            q_out    = modules[1].vqc(u_scaled)
-            outputs  = modules[1].classifier(q_out)
+            u_4      = feature_selector(u_batch)      # d → N_QUBITS
+            u_scaled = scale_features(u_4)
+            q_out    = vqc(u_scaled)
+            outputs  = classifier(q_out)
             loss     = criterion(outputs, labels_t)
         val = float(loss.item())
         return val if np.isfinite(val) else 1e6
@@ -274,18 +307,18 @@ def safe_result_fun(result) -> float:
 # Evaluation su feature d-dim pre-calcolate — con mini-batch loop
 # ---------------------------------------------------------------------------
 def evaluate_on_features(
-    modules:   list,
-    u_d:       torch.Tensor,  # (N, d)
-    labels_np: np.ndarray,
+    modules:    list,
+    u_d:        torch.Tensor,  # (N, d)
+    labels_np:  np.ndarray,
     criterion,
     device,
     batch_size: int = EVAL_BATCH_SIZE,
 ) -> tuple:
-    
-    # Valuta su feature d-dim pre-calcolate processando in mini-batch.
-    feature_selector, model = modules[0], modules[1]
+    """Valuta su feature d-dim pre-calcolate processando in mini-batch."""
+    feature_selector, vqc, classifier = modules
     feature_selector.eval()
-    model.eval()
+    vqc.eval()
+    classifier.eval()
 
     # Criterion separato con reduction='sum' per aggregazione corretta
     # tra batch di dimensioni diverse (ultimo batch potrebbe essere più piccolo).
@@ -305,9 +338,9 @@ def evaluate_on_features(
             y_batch  = torch.tensor(labels_np[start:end], dtype=torch.long, device=device)
 
             u_4      = feature_selector(u_batch)
-            u_scaled = model.scale_features(u_4)
-            q_out    = model.vqc(u_scaled)
-            outputs  = model.classifier(q_out)
+            u_scaled = scale_features(u_4)
+            q_out    = vqc(u_scaled)
+            outputs  = classifier(q_out)
             loss     = eval_criterion(outputs, y_batch)
 
             total_loss += loss.item()
@@ -344,8 +377,14 @@ def save_worker_csv(history: list, d: int, seed: int) -> None:
 # ---------------------------------------------------------------------------
 def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     """
-    Addestra HybridModel + feature_selector per una coppia (d, seed).
+    Addestra feature_selector + VQC + classifier per una coppia (d, seed).
     Le feature d-dim vengono lette dai CSV prodotti da test.py.
+
+    Nessuna dipendenza da ResNetCompressor/HybridModel: il circuito quantistico
+    e il classificatore lineare vengono costruiti direttamente da
+    QuantumPipeline + DirectVQC, eliminando l'istanziazione ridondante di un
+    backbone ResNet18 completo (~11.2M parametri) e il rifit di una PCA che
+    non venivano mai usati in questo flusso.
     """
     torch.set_num_threads(1)
     os.environ["OMP_NUM_THREADS"]      = "1"
@@ -401,15 +440,22 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         logger.error(traceback.format_exc())
         raise
 
-    # — Modello VQC ----------------------------------------------------------
-    # backbone_type=None: il backbone non viene mai invocato nel nuovo flusso.
-    # I CSV contengono già le feature d-dim pre-calcolate; HybridModel serve
-    # solo per model.vqc, model.classifier e model.scale_features.
+    # — Circuito quantistico + VQC + classifier -------------------------------
+    # Costruzione diretta, senza passare da HybridModel: niente backbone
+    # ResNet, niente fit PCA — solo i tre componenti realmente usati.
     try:
-        model = HybridModel(
-            {'d_latent': d, 'n_qubits': N_QUBITS, 'n_layers': 3, 'seed': seed},
-            backbone_type=None,
+        q_pipeline = QuantumPipeline(n_qubits=N_QUBITS, d_latent=d, n_layers=N_LAYERS)
+        circuit    = q_pipeline.build_circuit()
+
+        vqc = DirectVQC(
+            circuit     = circuit,
+            features_pv = q_pipeline.features,
+            weights_pv  = q_pipeline.weights,
+            n_qubits    = N_QUBITS,
+            estimator   = EstimatorV2(),
         ).to(device)
+
+        classifier = nn.Linear(N_QUBITS, N_CLASSES).to(device)
     except Exception:
         logger.error(traceback.format_exc())
         raise
@@ -418,17 +464,30 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     feature_selector = nn.Linear(d, N_QUBITS, bias=False).to(device)
     nn.init.orthogonal_(feature_selector.weight)
 
-    modules = [feature_selector, model]
+    modules = [feature_selector, vqc, classifier]
 
     n_fs    = sum(p.numel() for p in feature_selector.parameters() if p.requires_grad)
-    n_vqc   = sum(p.numel() for p in model.parameters()            if p.requires_grad)
-    n_total = n_fs + n_vqc
+    n_vc    = sum(
+        p.numel()
+        for module in (vqc, classifier)
+        for p in module.parameters()
+        if p.requires_grad
+    )
+    n_total = n_fs + n_vc
+
+    if n_total == 0:
+        raise RuntimeError(
+            f"d={d} seed={seed}: nessun parametro trainable trovato "
+            f"(feature_selector={n_fs}, vqc+classifier={n_vc}). "
+            "Verificare requires_grad sui moduli."
+        )
+
     logger.info(
         f"Parametri: feature_selector={n_fs} (d={d}×{N_QUBITS}) | "
-        f"VQC+classifier={n_vqc} | totale={n_total}"
+        f"VQC+classifier={n_vc} | totale={n_total}"
     )
     print(
-        f"[d={d} s={seed}] parametri: fs={n_fs} | vqc+clf={n_vqc} | tot={n_total}",
+        f"[d={d} s={seed}] parametri: fs={n_fs} | vqc+clf={n_vc} | tot={n_total}",
         flush=True,
     )
 
@@ -517,10 +576,15 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
             patience_ctr       = 0
             ckpt_path = f"experiments/models/best_vqc_{backbone}_d{d}_seed{seed}.pth"
             try:
+                # Salva solo i tre moduli realmente trainabili.
+                # Niente più pesi ResNet18 frozen inclusi per errore nel
+                # checkpoint (~44MB sprecati per file con il vecchio
+                # model.state_dict() di HybridModel).
                 torch.save(
                     {
-                        'model':            model.state_dict(),
                         'feature_selector': feature_selector.state_dict(),
+                        'vqc':              vqc.state_dict(),
+                        'classifier':       classifier.state_dict(),
                         'd':                d,
                         'seed':             seed,
                         'epoch':            epoch + 1,
@@ -612,7 +676,8 @@ def main():
         f"[INFO] feature_selector d→{N_QUBITS} | "
         f"pool={SAMPLES_POOL_PER_CLASS}/classe | batch={SAMPLES_PER_CLASS}/classe"
     )
-    print(f"[INFO] Feature lette da: artifacts/sweep/B1_pca_{{split}}_d{{d}}_seed{{seed}}.csv\n")
+    print(f"[INFO] Feature lette da: artifacts/sweep/B1_pca_{{split}}_d{{d}}_seed{{seed}}.csv")
+    print(f"[INFO] Nessun backbone ResNet/PCA istanziato a runtime — solo VQC diretto.\n")
 
     all_results = []
 
