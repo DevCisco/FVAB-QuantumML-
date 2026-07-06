@@ -56,7 +56,7 @@ from qiskit_algorithms.optimizers import NFT
 DIMS        = [32, 16, 8, 4]
 SEEDS       = [11, 17, 29]
 COMPRESSORS = ['B1', 'B2', 'B3']   # B1=PCA (test.py), B2=VanillaAE, B3=RegularizedAE
-EPOCHS      = 5
+EPOCHS      = 10
 PATIENCE    = 3
 
 # Percorsi CSV per ogni compressore — devono corrispondere esattamente a
@@ -240,9 +240,16 @@ def compute_class_weights(all_labels: np.ndarray) -> torch.Tensor:
 # non dipendiamo più da HybridModel. Pura funzione matematica, nessuno stato.
 # ---------------------------------------------------------------------------
 def scale_features(u: torch.Tensor) -> torch.Tensor:
+    """
+    Min-max scaling per-campione in [0, 2π] — range richiesto dall'interfaccia
+    di encoding congelata del progetto (documento iniziale, sezione 4):
+    "Scaling: min-max su train in [0, 2π]".
+
+    FIX: era erroneamente [0, π] — metà del range angolare specificato.
+    """
     u_min = u.min(dim=1, keepdim=True)[0]
     u_max = u.max(dim=1, keepdim=True)[0]
-    return (u - u_min) / (u_max - u_min + 1e-8) * np.pi
+    return (u - u_min) / (u_max - u_min + 1e-8) * (2 * np.pi)
 
 
 # ---------------------------------------------------------------------------
@@ -280,28 +287,23 @@ def set_trainable_params(modules: list, flat_params: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 def pretrain_feature_selector(
     feature_selector: nn.Module,
-    u_pool:           torch.Tensor,   # (N_pool, d) — pool completo pre-calcolato
-    y_pool:           np.ndarray,     # (N_pool,)
+    u_pool:           torch.Tensor,
+    y_pool:           np.ndarray,
     criterion,
     device,
+    pretrain_steps:   int = PRETRAIN_STEPS,
 ) -> None:
     """
     Ottimizza feature_selector con Adam usando una testa lineare temporanea.
 
-    La testa classica (temp_head) approssima il readout VQC per propagare
-    un gradiente coerente attraverso feature_selector. Viene scartata
-    al termine — serve solo a costruire il segnale di aggiornamento.
-
-    Usa il pool completo (256 campioni, 64/classe) a ogni step per massimizzare
-    la qualità del gradiente. Con Adam e 256 campioni, 200 passi convergono
-    in pochi secondi su CPU.
-
     Args:
-        feature_selector: nn.Linear(d, N_QUBITS, bias=False) — verrà aggiornato in-place.
-        u_pool:           feature d-dim del pool bilanciato.
-        y_pool:           label corrispondenti.
-        criterion:        CrossEntropyLoss con class weights dal training set.
-        device:           torch.device.
+        ...
+        pretrain_steps: override opzionale del budget di pre-training. Default
+            PRETRAIN_STEPS (200, usato dalla pipeline principale). Esposto per
+            gli studi di ablazione (vedi ablation_b3_pretrain.py) che testano
+            se l'instabilità di B3 a bassa d dipende da un budget di
+            ottimizzazione insufficiente piuttosto che da un limite
+            architetturale — senza toccare il comportamento di default.
     """
     temp_head = nn.Linear(N_QUBITS, N_CLASSES, bias=True).to(device)
     adam_opt  = torch.optim.Adam(
@@ -314,7 +316,7 @@ def pretrain_feature_selector(
     feature_selector.train()
     temp_head.train()
 
-    for _ in range(PRETRAIN_STEPS):
+    for _ in range(pretrain_steps):
         adam_opt.zero_grad()
         u_4     = feature_selector(u_pool)   # (N_pool, d) → (N_pool, 4)
         u_s     = scale_features(u_4)
@@ -431,10 +433,18 @@ def save_worker_csv(history: list, d: int, seed: int, compressor: str) -> None:
 # ---------------------------------------------------------------------------
 # Worker — un processo per coppia (d, seed)
 # ---------------------------------------------------------------------------
-def train_production(d: int, seed: int, compressor: str) -> dict:
+def train_production(d: int, seed: int, compressor: str,
+                      pretrain_steps: int = PRETRAIN_STEPS) -> dict:
     """
     Addestra feature_selector + VQC + classifier per una tripla (d, seed, compressor).
     Le feature d-dim vengono lette dal CSV del compressore specificato.
+
+    Args:
+        pretrain_steps: override opzionale del budget di pre-training Adam di
+            feature_selector. Default PRETRAIN_STEPS — nessuna modifica di
+            comportamento per la pipeline principale. Usato dagli studi di
+            ablazione per testare configurazioni con budget maggiorato senza
+            toccare i risultati già prodotti.
     """
     torch.set_num_threads(1)
     os.environ["OMP_NUM_THREADS"]      = "1"
@@ -537,9 +547,12 @@ def train_production(d: int, seed: int, compressor: str) -> dict:
 
     # — Pre-training feature_selector con Adam --------------------------------
     try:
-        pretrain_feature_selector(feature_selector, u_pool, y_pool, criterion, device)
-        logger.info(f"Pre-training feature_selector completato ({PRETRAIN_STEPS} step Adam)")
-        print(f"[d={d} s={seed}] pre-training Adam completato", flush=True)
+        pretrain_feature_selector(
+            feature_selector, u_pool, y_pool, criterion, device,
+            pretrain_steps=pretrain_steps,
+        )
+        logger.info(f"Pre-training feature_selector completato ({pretrain_steps} step Adam)")
+        print(f"[d={d} s={seed}] pre-training Adam completato ({pretrain_steps} step)", flush=True)
     except Exception:
         logger.error(f"Errore pre-training:\n{traceback.format_exc()}")
         raise

@@ -94,7 +94,7 @@ def load_features(compressor: str, split: str, d: int, seed: int) -> tuple:
 # ---------------------------------------------------------------------------
 # Expected Calibration Error (ECE)
 # ---------------------------------------------------------------------------
-def compute_ece(y_true: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> float:
+def compute_ece(y_true: np.ndarray, y_proba: np.ndarray, n_bins: int = 15) -> float:
     """
     ECE per classificazione multiclasse con binning uniforme.
 
@@ -114,7 +114,10 @@ def compute_ece(y_true: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> fl
     Args:
         y_true  : label reali, shape (N,).
         y_proba : probabilità predette, shape (N, n_classes).
-        n_bins  : numero di bin uniformi in [0, 1]. Default 10.
+        n_bins  : numero di bin uniformi in [0, 1]. Default 15 — richiesto dal
+            documento iniziale (sezione "Metriche operative da congelare"):
+            "ECE sia la top-label multiclass calibration error con 15 bin
+            uniformi e norma L1". FIX: era 10.
 
     Returns:
         ECE in [0, 1].
@@ -173,7 +176,8 @@ def evaluate_compressor(
     clf = LogisticRegression(
         max_iter    = 1000,
         random_state= seed,
-        solver      = 'lbfgs'
+        solver      = 'lbfgs',
+        multi_class = 'multinomial',
     )
     clf.fit(X_train, y_train)
 
@@ -183,7 +187,7 @@ def evaluate_compressor(
     macro_f1  = float(f1_score(y_test, y_pred, average='macro', zero_division=0))
     macro_auc = float(roc_auc_score(y_test, y_proba, multi_class='ovr', average='macro'))
     bal_acc   = float(balanced_accuracy_score(y_test, y_pred))
-    ece       = compute_ece(y_test, y_proba, n_bins=10)
+    ece       = compute_ece(y_test, y_proba, n_bins=15)
     accuracy  = float(accuracy_score(y_test, y_pred))
 
     return {
