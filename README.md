@@ -6,7 +6,7 @@
 2. [Requisiti](#requisiti)
 3. [Dipendenze](#dipendenze)
 4. [Ordine di esecuzione](#ordine-di-esecuzione)
-   - [1. `generate_fixed_splits.py`](#1-generate_splitspy--prerequisito)
+   - [1. `generate_fixed_splits.py`](#1-generate_fixed_splitspy--prerequisito)
    - [2. `test.py`](#2-testpy)
    - [3. `save_raw_features.py`](#3-save_raw_featurespy--opzionale)
    - [4. `week_ae_training.py`](#4-week_ae_trainingpy)
@@ -74,7 +74,7 @@ python -m pip install torch torchvision --index-url https://download.pytorch.org
 
 | # | Script | Note |
 |:-:|:-------|:-----|
-| 1 | `generate_splits.py` | ⚠️ Prerequisito — vedi nota sotto |
+| 1 | `generate_fixed_splits.py` | ⚠️ Prerequisito — vedi nota sotto |
 | 2 | `test.py` | |
 | 3 | `save_raw_features.py` | Opzionale — vedi nota sotto |
 | 4 | `week_ae_training.py` | Necessario solo per B2/B3 |
@@ -86,7 +86,7 @@ python -m pip install torch torchvision --index-url https://download.pytorch.org
 
 ---
 
-### 1. `generate_splits.py` — prerequisito
+### 1. `generate_fixed_splits.py` — prerequisito
 
 > ⚠️ **Non incluso tra i file consegnati in questa sessione.**
 

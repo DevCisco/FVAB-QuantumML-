@@ -5,8 +5,17 @@ import torchvision.transforms as transforms
 import pandas as pd
 import os
 
+# Statistiche di normalizzazione usate in tutto il progetto per le immagini
+# in ingresso al backbone ResNet18. Esposte come costanti — non solo come
+# valori inline — così altri file (es. week8_robustness.py) possono costruire
+# trasformazioni custom (es. con rumore) restando coerenti con quelle usate
+# qui, invece di duplicare i valori con rischio di disallineamento silenzioso.
+NORM_MEAN = [0.5, 0.5, 0.5]
+NORM_STD  = [0.5, 0.5, 0.5]
 
-def get_data_loaders(seed, batch_size=128, resize=224, split_dir="dataset_splits"):
+
+def get_data_loaders(seed, batch_size=128, resize=224, split_dir="dataset_splits",
+                      transform=None):
     """
     Restituisce (train_loader, val_loader, test_loader) per una coppia (d, seed).
 
@@ -31,19 +40,29 @@ def get_data_loaders(seed, batch_size=128, resize=224, split_dir="dataset_splits
     2. Nessun data leakage dal backbone → i pesi MedMNIST vengono da un ResNet
        addestrato sul canonical OCTMNIST train split. Il test fisso (canonical val
        + canonical test) non è mai entrato nei gradienti del backbone.
+
+    Args:
+        transform: trasformazione torchvision custom (opzionale). Se None
+            (default), usa Resize+ToTensor+Normalize(NORM_MEAN, NORM_STD) —
+            il comportamento standard del progetto. Permette di iniettare
+            trasformazioni aggiuntive (es. rumore gaussiano) mantenendo lo
+            stesso identico split fisso, necessario per confrontare in modo
+            equo risultati "clean" e "noisy" sullo stesso test set
+            (usato da week8_robustness.py).
     """
 
-    data_transform = transforms.Compose([
-        transforms.Resize((resize, resize)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
+    if transform is None:
+        transform = transforms.Compose([
+            transforms.Resize((resize, resize)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=NORM_MEAN, std=NORM_STD),
+        ])
 
     # ConcatDataset identico alla versione precedente — gli indici nei CSV
     # sono riferiti a questo dataset concatenato e rimangono compatibili.
-    full_train   = OCTMNIST(split='train', transform=data_transform, download=True, as_rgb=True)
-    full_val     = OCTMNIST(split='val',   transform=data_transform, download=True, as_rgb=True)
-    full_test    = OCTMNIST(split='test',  transform=data_transform, download=True, as_rgb=True)
+    full_train   = OCTMNIST(split='train', transform=transform, download=True, as_rgb=True)
+    full_val     = OCTMNIST(split='val',   transform=transform, download=True, as_rgb=True)
+    full_test    = OCTMNIST(split='test',  transform=transform, download=True, as_rgb=True)
     full_dataset = ConcatDataset([full_train, full_val, full_test])
 
     try:

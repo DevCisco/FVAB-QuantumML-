@@ -1,180 +1,318 @@
-import pandas as pd
+"""
+master_sweep_team_b.py
+
+Confronto sistematico dei tre compressori B1/B2/B3 con LogisticRegression
+su tutte le combinazioni (d, seed).
+
+Prerequisiti — questi file devono esistere prima di eseguire questo script:
+  • B1: artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv
+          → generati da test.py
+  • B2: artifacts/sweep/B2_pca_{split}_d{d}_seed{seed}.csv
+          → generati da b2_b3_training.py
+  • B3: artifacts/sweep/B3_pca_{split}_d{d}_seed{seed}.csv
+          → generati da b2_b3_training.py
+
+Metriche riportate per ogni combinazione (compressore, d, seed):
+  • macro-F1 su test set (metrica principale, coerente con train_vqc_production.py)
+  • accuracy su test set
+
+Output:
+  • artifacts/sweep/team_b_comparison.csv  — dettaglio per ogni (compressore, d, seed)
+  • artifacts/sweep/team_b_summary.csv     — media e std per (compressore, d)
+
+Il VQC non è incluso qui — è gestito da train_vqc_production.py.
+Questo file confronta solo i compressori come estrattori di feature,
+usando LogisticRegression come classificatore di riferimento.
+"""
+
 import os
-import torch
-import joblib
+
 import numpy as np
-from pca_res_compressors import PCACompressor
+import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
-
-from seed_manager import set_seed
-from train_compressors_b import train_ae
-from generate_features_b import extract_b_features
-from vqc_fewshot_engine import train_vqc
-
-
-# ============================================================================
-# CONFIGURAZIONE GLOBALE
-# ============================================================================
-SEEDS = [11, 17, 29]
-DIMS = [32, 16, 8, 4]
-ARTIFACTS_DIR = "artifacts"
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    roc_auc_score,
+)
 
 
-# ============================================================================
-# FUNZIONI HELPER
-# ============================================================================
-def run_vqc_mock(X, y):
+# ---------------------------------------------------------------------------
+# Configurazione
+# ---------------------------------------------------------------------------
+DIMS         = [32, 16, 8, 4]
+SEEDS        = [11, 17, 29]
+COMPRESSORS  = ['B1', 'B2', 'B3']
+ARTIFACTS    = "artifacts/sweep"
+
+# Path CSV per ogni compressore — devono corrispondere esattamente a quelli
+# prodotti da test.py (B1) e b2_b3_training.py (B2, B3).
+CSV_PATHS = {
+    'B1': "artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv",
+    'B2': "artifacts/sweep/B2_pca_{split}_d{d}_seed{seed}.csv",
+    'B3': "artifacts/sweep/B3_pca_{split}_d{d}_seed{seed}.csv",
+}
+
+
+# ---------------------------------------------------------------------------
+# Lettura CSV
+# ---------------------------------------------------------------------------
+def load_features(compressor: str, split: str, d: int, seed: int) -> tuple:
     """
-    Placeholder per VQC. Ritorna un valore random di accuratezza.
-    (Sarà sostituito con valutazione reale quando implementato)
+    Carica feature e label dal CSV del compressore specificato.
+
+    Il formato è identico per B1, B2 e B3:
+      colonne feat_*  → feature numeriche (d colonne)
+      colonna label   → classe target (0-3)
+
+    Args:
+        compressor: 'B1' | 'B2' | 'B3'
+        split:      'train' | 'val' | 'test'
+        d:          dimensione latente (4/8/16/32)
+        seed:       seed (11/17/29)
+
+    Returns:
+        X (ndarray float32, shape (N, d)), y (ndarray int, shape (N,))
     """
-    return np.random.uniform(0.20, 0.40)
+    path = CSV_PATHS[compressor].format(split=split, d=d, seed=seed)
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"File non trovato: {path}\n"
+            f"Per B1: eseguire test.py\n"
+            f"Per B2/B3: eseguire b2_b3_training.py"
+        )
+
+    df        = pd.read_csv(path)
+    feat_cols = [c for c in df.columns if c != 'label']
+    X         = df[feat_cols].values.astype(np.float32)
+    y         = df['label'].values.astype(int)
+    return X, y
 
 
-def load_resnet_features(seed):
+# ---------------------------------------------------------------------------
+# Expected Calibration Error (ECE)
+# ---------------------------------------------------------------------------
+def compute_ece(y_true: np.ndarray, y_proba: np.ndarray, n_bins: int = 10) -> float:
     """
-    Carica le feature estratte da ResNet per un dato seed.
-    Ritorna: X_val, y_val, X_test, y_test
+    ECE per classificazione multiclasse con binning uniforme.
+
+    Usa la probabilità massima predetta (top-1 confidence) come stima
+    della fiducia del modello. Misura quanto le probabilità predette
+    corrispondano alle frequenze empiriche di correttezza.
+
+    Formula:
+        ECE = Σ_b (|B_b| / n) · |acc(B_b) − conf(B_b)|
+
+    dove B_b è l'insieme dei campioni il cui confidence cade nel bin b,
+    acc(B_b) è l'accuratezza empirica nel bin e conf(B_b) è la fiducia media.
+
+    Un modello perfettamente calibrato ha ECE = 0.
+    Valori alti indicano overconfidence o underconfidence sistematica.
+
+    Args:
+        y_true  : label reali, shape (N,).
+        y_proba : probabilità predette, shape (N, n_classes).
+        n_bins  : numero di bin uniformi in [0, 1]. Default 10.
+
+    Returns:
+        ECE in [0, 1].
     """
-    data_val = np.load(f"{ARTIFACTS_DIR}/resnet/resnet_base_512_val.npz")
-    data_test = np.load(f"{ARTIFACTS_DIR}/resnet/resnet_base_512_test.npz")
+    confidences = y_proba.max(axis=1)          # top-1 confidence per campione
+    predictions = y_proba.argmax(axis=1)
+    correct     = (predictions == y_true).astype(float)
 
-    X_val = data_val['features']
-    y_val = data_val['labels'].ravel()
-    X_test = data_test['features']
-    y_test = data_test['labels'].ravel()
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
 
-    return X_val, y_val, X_test, y_test
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        # Ultimo bin: include il boundary superiore (confidence == 1.0)
+        if i < n_bins - 1:
+            mask = (confidences >= lo) & (confidences < hi)
+        else:
+            mask = (confidences >= lo) & (confidences <= hi)
+
+        if mask.sum() == 0:
+            continue
+
+        bin_acc  = correct[mask].mean()
+        bin_conf = confidences[mask].mean()
+        bin_w    = mask.sum() / len(y_true)
+        ece     += bin_w * abs(bin_acc - bin_conf)
+
+    return float(ece)
 
 
-def train_and_save_compressors(d, s, X_train):
+
+# ---------------------------------------------------------------------------
+# Valutazione con LogisticRegression
+# ---------------------------------------------------------------------------
+def evaluate_compressor(
+    compressor: str,
+    d:          int,
+    seed:       int,
+) -> dict:
     """
-    Addestra e salva i compressori B1 (PCA), B2 (VanillaAE), B3 (RegularizedAE).
-    B1 è salvato solo la prima volta per ogni d.
-    Ritorna: compressor_models (dict)
+    Addestra LogisticRegression su train e valuta su test con quattro metriche.
+
+    Metriche calcolate:
+      • macro-F1          — media non pesata del F1 per classe
+      • macro-AUROC       — area sotto la curva ROC, schema OvR, media su classi
+      • balanced accuracy — media dei recall per classe (= macro-recall)
+      • ECE               — Expected Calibration Error (top-1 confidence, 10 bin)
+      • accuracy          — accuracy standard, a titolo di riferimento
+
+    Usa il test set fisso (canonical val + canonical test MedMNIST),
+    identico per tutti i seed — coerente con train_vqc_production.py.
     """
-    os.makedirs(f"{ARTIFACTS_DIR}/sweep", exist_ok=True)
+    X_train, y_train = load_features(compressor, 'train', d, seed)
+    X_test,  y_test  = load_features(compressor, 'test',  d, seed)
 
-    # B1: PCA (salvato solo per il primo seed)
-    if s == SEEDS[0]:
-        pca = PCACompressor(n_components=d)
-        pca.fit(X_train)
-        joblib.dump(pca, f"{ARTIFACTS_DIR}/sweep/B1_pca_d{d}.pkl")
-        print(f" Salvato: {ARTIFACTS_DIR}/sweep/B1_pca_d{d}.pkl")
+    clf = LogisticRegression(
+        max_iter    = 1000,
+        random_state= seed,
+        solver      = 'lbfgs'
+    )
+    clf.fit(X_train, y_train)
 
-    # B2: VanillaAE
-    m_b2 = train_ae('B2', d, X_train, s)
-    torch.save(m_b2.state_dict(), f"{ARTIFACTS_DIR}/sweep/B2_d{d}_s{s}.pt")
-    print(f" Salvato: {ARTIFACTS_DIR}/sweep/B2_d{d}_s{s}.pt")
+    y_pred  = clf.predict(X_test)
+    y_proba = clf.predict_proba(X_test)   # (N, 4) — necessario per AUROC e ECE
 
-    # B3: RegularizedAE
-    m_b3 = train_ae('B3', d, X_train, s)
-    torch.save(m_b3.state_dict(), f"{ARTIFACTS_DIR}/sweep/B3_d{d}_s{s}.pt")
-    print(f" Salvato: {ARTIFACTS_DIR}/sweep/B3_d{d}_s{s}.pt")
+    macro_f1  = float(f1_score(y_test, y_pred, average='macro', zero_division=0))
+    macro_auc = float(roc_auc_score(y_test, y_proba, multi_class='ovr', average='macro'))
+    bal_acc   = float(balanced_accuracy_score(y_test, y_pred))
+    ece       = compute_ece(y_test, y_proba, n_bins=10)
+    accuracy  = float(accuracy_score(y_test, y_pred))
 
-    return {'B2': m_b2, 'B3': m_b3}
+    return {
+        'compressor':   compressor,
+        'd':            d,
+        'seed':         seed,
+        'macro_f1':     round(macro_f1,  6),
+        'macro_auroc':  round(macro_auc, 6),
+        'balanced_acc': round(bal_acc,   6),
+        'ece':          round(ece,        6),
+        'accuracy':     round(accuracy,   6),
+    }
 
 
-def train_and_save_vqc(d, s, train_features, y_train):
+
+# ---------------------------------------------------------------------------
+# Esperimento completo
+# ---------------------------------------------------------------------------
+def run_comparison() -> pd.DataFrame:
     """
-    Addestra il modello VQC su feature B1 e lo salva.
-    """
-    X_train_vqc = torch.tensor(train_features).float()
-    y_train_vqc = torch.tensor(y_train).long()
-
-    vqc_model = train_vqc(X_train_vqc, y_train_vqc, d, epochs=10)
-    torch.save(vqc_model.state_dict(), f"{ARTIFACTS_DIR}/sweep/vqc_d{d}_s{s}.pt")
-    print(f" Salvato: {ARTIFACTS_DIR}/sweep/vqc_d{d}_s{s}.pt")
-
-    return vqc_model
-
-
-def evaluate_classifiers(train_features, test_features, y_train, y_test, s):
-    """
-    Valuta classificatori Logistic Regression e VQC (mock) su tutti i case.
-    Ritorna lista di risultati (dict).
+    Esegue la valutazione per tutte le combinazioni (compressore, d, seed)
+    e restituisce il DataFrame dei risultati dettagliati.
     """
     results = []
+    n_total = len(COMPRESSORS) * len(DIMS) * len(SEEDS)
+    done    = 0
 
-    for case in ['B1', 'B2', 'B3']:
-        # Logistic Regression
-        clf = LogisticRegression(max_iter=1000, random_state=s)
-        clf.fit(train_features[case], y_train)
-        acc_lr = accuracy_score(y_test, clf.predict(test_features[case]))
-
-        # VQC (mock)
-        acc_vqc = run_vqc_mock(train_features[case], y_train)
-
-        results.append({
-            'seed': s,
-            'case': case,
-            'acc_lr': round(acc_lr * 100, 4),
-            'acc_vqc': round(acc_vqc * 100, 4),
-        })
-    return results
-
-
-# ============================================================================
-# MAIN EXPERIMENT
-# ============================================================================
-def run_team_b_experiment():
-    """
-    Esegue l'esperimento completo del Team B:
-    1. Addestra compressori (B1, B2, B3)
-    2. Addestra modello VQC
-    3. Valuta classificatori su tutte le varianti
-    4. Salva risultati in CSV
-    """
-    all_results = []
-
-    for s in SEEDS:
-        print(f"\n{'='*70}")
-        print(f"SEED: {s}")
-        print(f"{'='*70}")
-
-        # Carica feature ResNet
-        X_val, y_val, X_test, y_test = load_resnet_features(s)
-
+    for compressor in COMPRESSORS:
         for d in DIMS:
-            print(f"\n  Dimensione: d={d}")
-            print(f"  {'-'*70}")
+            for seed in SEEDS:
+                done += 1
+                try:
+                    row = evaluate_compressor(compressor, d, seed)
+                    results.append(row)
+                    print(
+                        f"[{done:2d}/{n_total}] {compressor} d={d:2d} seed={seed} | "
+                        f"F1: {row['macro_f1']:.4f} | "
+                        f"AUROC: {row['macro_auroc']:.4f} | "
+                        f"BalAcc: {row['balanced_acc']:.4f} | "
+                        f"ECE: {row['ece']:.4f}",
+                        flush=True,
+                    )
+                except FileNotFoundError as e:
+                    print(f"[SKIP] {compressor} d={d} seed={seed} → {e}", flush=True)
+                except Exception as e:
+                    print(f"[ERROR] {compressor} d={d} seed={seed} → {e}", flush=True)
 
-            # Imposta seed per riproducibilità
-            set_seed(s)
+    return pd.DataFrame(results)
 
-            # Step 1: Addestra e salva compressori (B2, B3)
-            compressors = train_and_save_compressors(d, s, X_val)
 
-            # Step 2: Estrai feature con tutti i compressori
-            train_feats, test_feats = extract_b_features(
-                d, X_val, X_test, compressors['B2'], compressors['B3']
-            )
+# ---------------------------------------------------------------------------
+# Riepilogo per (compressore, d)
+# ---------------------------------------------------------------------------
+def make_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcola media e std di tutte le metriche su tutti i seed
+    per ogni coppia (compressore, d).
+    """
+    summary = (
+        df.groupby(['compressor', 'd'])
+        .agg(
+            macro_f1_mean    =('macro_f1',     'mean'),
+            macro_f1_std     =('macro_f1',     'std'),
+            macro_auroc_mean =('macro_auroc',  'mean'),
+            macro_auroc_std  =('macro_auroc',  'std'),
+            balanced_acc_mean=('balanced_acc', 'mean'),
+            balanced_acc_std =('balanced_acc', 'std'),
+            ece_mean         =('ece',          'mean'),
+            ece_std          =('ece',          'std'),
+            accuracy_mean    =('accuracy',     'mean'),
+            accuracy_std     =('accuracy',     'std'),
+        )
+        .reset_index()
+    )
+    for col in summary.select_dtypes(include='float').columns:
+        summary[col] = summary[col].round(6)
+    summary = summary.sort_values(
+        ['d', 'compressor'], ascending=[False, True]
+    ).reset_index(drop=True)
+    return summary
 
-            # Step 3: Addestra e salva VQC
-            train_and_save_vqc(d, s, train_feats['B1'], y_val)
 
-            # Step 4: Valuta tutti i classificatori
-            case_results = evaluate_classifiers(
-                train_feats, test_feats, y_val, y_test, s
-            )
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main():
+    os.makedirs(ARTIFACTS, exist_ok=True)
 
-            # Aggiungi dimensione ai risultati
-            for res in case_results:
-                res['d'] = d
+    print("=" * 65)
+    print("CONFRONTO COMPRESSORI: B1 (PCA) vs B2 (VanillaAE) vs B3 (RegularizedAE)")
+    print("Classificatore: LogisticRegression | Metrica principale: macro-F1")
+    print("=" * 65 + "\n")
 
-            all_results.extend(case_results)
+    # Valutazione dettagliata
+    df = run_comparison()
 
-    # Salva risultati finali
-    os.makedirs(f"{ARTIFACTS_DIR}/sweep", exist_ok=True)
-    df = pd.DataFrame(all_results)
-    df.to_csv(f"{ARTIFACTS_DIR}/sweep/team_b_final_results.csv", index=False)
+    if df.empty:
+        print("\n[WARNING] Nessun risultato — verificare che i CSV esistano.")
+        return
 
-    print(f"\n{'='*70}")
-    print("ESPERIMENTO COMPLETATO")
-    print(f"Risultati salvati: {ARTIFACTS_DIR}/sweep/team_b_final_results.csv")
-    print(f"{'='*70}\n")
+    # Salvataggio dettaglio
+    detail_path = f"{ARTIFACTS}/team_b_comparison.csv"
+    df.to_csv(detail_path, index=False)
+
+    # Riepilogo per (compressore, d)
+    summary = make_summary(df)
+    summary_path = f"{ARTIFACTS}/team_b_summary.csv"
+    summary.to_csv(summary_path, index=False)
+
+    print("\n" + "=" * 65)
+    print("RIEPILOGO — medie su 3 seed per (compressore, d)")
+    print("=" * 65)
+
+    for metric, label in [
+        ('macro_f1_mean',     'macro-F1'),
+        ('macro_auroc_mean',  'macro-AUROC'),
+        ('balanced_acc_mean', 'balanced accuracy'),
+        ('ece_mean',          'ECE (↓ meglio)'),
+    ]:
+        pivot = summary.pivot(
+            index='d', columns='compressor', values=metric
+        ).sort_index(ascending=False)
+        print(f"\n{label}:")
+        print(pivot.to_string())
+
+    print(f"\nDettaglio  → {detail_path}")
+    print(f"Riepilogo  → {summary_path}")
+    print("\n[DONE] Confronto completato.")
 
 
 if __name__ == "__main__":
-    run_team_b_experiment()
+    main()

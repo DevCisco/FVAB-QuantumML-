@@ -8,14 +8,12 @@ import torch.optim as optim
 
 from unsupervised_models import VanillaAE, RegularizedAE
 
-
 # ---------------------------------------------------------------------------
 # Costanti globali
 # ---------------------------------------------------------------------------
 DIMS           = [32, 16, 8, 4]
 SEEDS          = [11, 17, 29]
-BACKBONE       = 'resnet'
-EPOCHS         = 30
+EPOCHS         = 10
 BATCH_SIZE     = 256
 LR             = 1e-3
 RECONSTRUCTION = nn.MSELoss()
@@ -23,9 +21,10 @@ RECONSTRUCTION = nn.MSELoss()
 # ---------------------------------------------------------------------------
 # Caricamento features
 # ---------------------------------------------------------------------------
-def load_features(split: str, d: int, seed: int) -> torch.Tensor:
+def load_features(split: str, d: int, seed: int) -> tuple:
     """
-    Carica le feature ResNet18 raw (512 dim) dal file .npz prodotto da test.py.
+    Carica le feature ResNet18 raw (512 dim) e le label dal file .npz
+    prodotto da test.py.
 
     Path NPZ: artifacts/resnet/features/res_raw_d_{d}_{split}_s{seed}.npz
 
@@ -38,22 +37,23 @@ def load_features(split: str, d: int, seed: int) -> torch.Tensor:
         Immagine -> ResNet18 -> 512 dim -> PCA → d dim → AE (B2/B3) e VQC/few-shot
 
     Args:
-        split (str): 'train' | 'val'.
+        split (str): 'train' | 'val' | 'test'.
         d (int): dimensione del bottleneck latente.
         seed (int): seed per riproducibilità.
 
     Returns:
-        Tensor shape (N, 512), dtype float32.
+        Tuple (Tensor shape (N, 512) dtype float32, ndarray labels shape (N,)).
     """
-    
+
     # Path NPZ
     npz_path = f"artifacts/resnet/features/res_raw_d_{d}_{split}_s{seed}.npz"
-    
+
     # Leggi NPZ direttamente in memoria
     data = np.load(npz_path)
     features = data['features'].astype(np.float32)
-    
-    return torch.tensor(features, dtype=torch.float32)
+    labels   = data['labels']
+
+    return torch.tensor(features, dtype=torch.float32), labels
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +64,10 @@ def train_vanilla_ae(d: int, seed: int) -> dict:
     Addestra VanillaAE (B2) per una coppia (d, seed).
 
     Architettura: 512 → 128 → d → 128 → 512
-    Artifact salvati in: artifacts/sweep/B2_pca_{split}_d{d}_seed{seed}.csv
-    Path atteso da week8_robustness.py.
+    Artifact salvati:
+      • artifacts/sweep/B2_d{d}_s{seed}.pt              — pesi del modello
+      • artifacts/sweep/B2_pca_{split}_d{d}_seed{seed}.csv — feature latenti
+    Entrambi i path sono attesi da week8_robustness.py.
 
     Args:
         d    (int): dimensione del bottleneck latente (4/8/16/32).
@@ -76,8 +78,13 @@ def train_vanilla_ae(d: int, seed: int) -> dict:
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X_train = load_features('train', d, seed).to(device)
-    X_val   = load_features('val', d, seed).to(device)
+    X_train, labels_train = load_features('train', d, seed)
+    X_val,   labels_val   = load_features('val',   d, seed)
+    X_test,  labels_test  = load_features('test',  d, seed)
+
+    X_train = X_train.to(device)
+    X_val   = X_val.to(device)
+    X_test  = X_test.to(device)
 
     model     = VanillaAE(d_latent=d).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR)
@@ -120,17 +127,29 @@ def train_vanilla_ae(d: int, seed: int) -> dict:
                 flush=True,
             )
 
-    # — Salva latent features in CSV ----------------------------------------------
+    # — Salva checkpoint del modello (richiesto da week8_robustness.py) -------
+    # Prima mancava del tutto: solo le feature latenti venivano salvate,
+    # non i pesi. Senza questo file, week8_robustness.py non può caricare
+    # il compressore per il test di robustezza con rumore gaussiano.
+    ckpt_path = f"artifacts/sweep/B2_d{d}_s{seed}.pt"
+    torch.save(model.state_dict(), ckpt_path)
+
+    # — Salva latent features in CSV (train + val + test) ---------------------
     model.eval()
     with torch.no_grad():
-        for split, X in [('train', X_train), ('val', X_val)]:
+        for split, X, labels in [
+            ('train', X_train, labels_train),
+            ('val',   X_val,   labels_val),
+            ('test',  X_test,  labels_test),
+        ]:
             _, latent = model(X)
             latent_np = latent.cpu().numpy()
             df = pd.DataFrame(latent_np, columns=[f"latent_{i}" for i in range(d)])
+            df['label'] = labels.ravel()
             csv_path = f"artifacts/sweep/B2_pca_{split}_d{d}_seed{seed}.csv"
             df.to_csv(csv_path, index=False)
 
-    print(f"  [B2] d={d:2d} | seed={seed} → Best Val Loss: {best_val_loss:.6f} | Latent features salvate")
+    print(f"  [B2] d={d:2d} | seed={seed} → Best Val Loss: {best_val_loss:.6f} | Checkpoint + latent features salvati")
     return {"model": "B2", "d": d, "seed": seed, "best_val_loss": best_val_loss}
 
 
@@ -145,8 +164,10 @@ def train_regularized_ae(d: int, seed: int) -> dict:
     Loss totale = MSE(recon, x) + model.sparsity_loss(z)
     Val loss = solo MSE per confronto equo con B2.
 
-    Artifact salvati in: artifacts/sweep/B3_pca_{split}_d{d}_seed{seed}.csv
-    Path atteso da week8_robustness.py.
+    Artifact salvati:
+      • artifacts/sweep/B3_d{d}_s{seed}.pt              — pesi del modello
+      • artifacts/sweep/B3_pca_{split}_d{d}_seed{seed}.csv — feature latenti
+    Entrambi i path sono attesi da week8_robustness.py.
 
     Args:
         d    (int): dimensione del bottleneck latente (4/8/16/32).
@@ -157,8 +178,13 @@ def train_regularized_ae(d: int, seed: int) -> dict:
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X_train = load_features('train', d, seed).to(device)
-    X_val   = load_features('val', d, seed).to(device)
+    X_train, labels_train = load_features('train', d, seed)
+    X_val,   labels_val   = load_features('val',   d, seed)
+    X_test,  labels_test  = load_features('test',  d, seed)
+
+    X_train = X_train.to(device)
+    X_val   = X_val.to(device)
+    X_test  = X_test.to(device)
 
     model     = RegularizedAE(d_latent=d).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR)
@@ -201,17 +227,26 @@ def train_regularized_ae(d: int, seed: int) -> dict:
                 flush=True,
             )
 
-    # — Salva latent features in CSV ----------------------------------------------
+    # — Salva checkpoint del modello (richiesto da week8_robustness.py) -------
+    ckpt_path = f"artifacts/sweep/B3_d{d}_s{seed}.pt"
+    torch.save(model.state_dict(), ckpt_path)
+
+    # — Salva latent features in CSV (train + val + test) ---------------------
     model.eval()
     with torch.no_grad():
-        for split, X in [('train', X_train), ('val', X_val)]:
+        for split, X, labels in [
+            ('train', X_train, labels_train),
+            ('val',   X_val,   labels_val),
+            ('test',  X_test,  labels_test),
+        ]:
             _, latent = model(X)
             latent_np = latent.cpu().numpy()
             df = pd.DataFrame(latent_np, columns=[f"latent_{i}" for i in range(d)])
+            df['label'] = labels.ravel()
             csv_path = f"artifacts/sweep/B3_pca_{split}_d{d}_seed{seed}.csv"
             df.to_csv(csv_path, index=False)
 
-    print(f"  [B3] d={d:2d} | seed={seed} → Best Val Loss: {best_val_loss:.6f} | Latent features salvate")
+    print(f"  [B3] d={d:2d} | seed={seed} → Best Val Loss: {best_val_loss:.6f} | Checkpoint + latent features salvati")
     return {"model": "B3", "d": d, "seed": seed, "best_val_loss": best_val_loss}
 
 

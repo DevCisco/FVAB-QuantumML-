@@ -53,13 +53,19 @@ from qiskit_algorithms.optimizers import NFT
 # ---------------------------------------------------------------------------
 # Costanti globali
 # ---------------------------------------------------------------------------
-DIMS     = [32, 16, 8, 4]
-SEEDS    = [11, 17, 29]
-BACKBONE = 'pca'   # etichetta per file/log — riflette che le feature CSV sono
-                   # già compresse via PCA in test.py, non controlla più nulla
-                   # nella costruzione del modello (vedi nota sopra).
-EPOCHS   = 10
-PATIENCE = 3
+DIMS        = [32, 16, 8, 4]
+SEEDS       = [11, 17, 29]
+COMPRESSORS = ['B1', 'B2', 'B3']   # B1=PCA (test.py), B2=VanillaAE, B3=RegularizedAE
+EPOCHS      = 5
+PATIENCE    = 3
+
+# Percorsi CSV per ogni compressore — devono corrispondere esattamente a
+# quelli prodotti da test.py (B1) e b2_b3_training.py (B2, B3).
+COMPRESSOR_PATHS = {
+    'B1': "artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv",
+    'B2': "artifacts/sweep/B2_pca_{split}_d{d}_seed{seed}.csv",
+    'B3': "artifacts/sweep/B3_pca_{split}_d{d}_seed{seed}.csv",
+}
 
 MAX_EVALS_NFT = 300
 MAX_WORKERS   = 4
@@ -76,45 +82,35 @@ EVAL_BATCH_SIZE = 512
 
 JOB_TIMEOUT_SEC = 8 * 3600
 
-
 # ---------------------------------------------------------------------------
-# Budget NFT scalato con il numero di parametri trainabili
+# Pre-training di feature_selector con Adam
 #
-# Problema: feature_selector ha d×N_QUBITS parametri — con d=32 i parametri
-# totali (164) sono più del triplo di d=4 (52), ma MAX_EVALS_NFT era fisso
-# a 300 per tutti. Risultato osservato: d=16 (100 param) ottiene esattamente
-# 3.0 sweep completi e converge stabilmente su tutti i seed. d=32 (164 param)
-# otteneva solo 1.8 sweep e falliva catastroficamente su alcuni seed — con
-# meno di 2 sweep, l'ordine in cui NFT visita i parametri diventa
-# determinante per il risultato.
+# Problema risolto: NFT ottimizza un parametro alla volta (parameter shift
+# analitico) e scala male in alta dimensione. feature_selector ha d×N_QUBITS
+# parametri: d=32 → 128 param, d=4 → 16 param. Con maxfev=300 fisso, d=32
+# riceveva ~1.8 sweep completi — insufficienti a gestire le interazioni tra
+# 128 parametri interdipendenti → d=32 underperformava rispetto a d=4 (soli
+# 16 param, ~5.8 sweep), invertendo l'ordine atteso.
 #
-# Fix: scala il budget SOLO quando serve, con un floor a MAX_EVALS_NFT (300).
-# d=4/8/16 restano IDENTICI a prima (nessuna regressione su config già
-# validate). Solo d=32 sale a 492 (+64%, il minimo per garantire 3 sweep).
-NFT_TARGET_SWEEPS = 3   # sweep minimi garantiti — validato empiricamente su d=16
-
-
-def get_max_evals_nft(n_trainable_params: int) -> int:
-    """
-    Calcola maxfev sufficiente per almeno NFT_TARGET_SWEEPS sweep completi,
-    senza mai scendere sotto MAX_EVALS_NFT (300) per non alterare il
-    comportamento delle configurazioni d<=16 già validate.
-
-    Args:
-        n_trainable_params: somma di feature_selector + VQC + classifier.
-
-    Returns:
-        maxfev da passare a NFT().
-    """
-    return max(MAX_EVALS_NFT, n_trainable_params * NFT_TARGET_SWEEPS)
+# Fix — separazione degli ottimizzatori per natura del problema:
+#   • Adam     → feature_selector (d*4 param, backprop, scala O(n) con d)
+#   • NFT      → VQC + classifier (36 param fissi, indipendente da d)
+#
+# Dopo il pre-training, feature_selector viene congelato.
+# Le feature proiettate (pool/val/test) vengono pre-calcolate UNA SOLA VOLTA
+# → NFT nel hot loop chiama esclusivamente vqc + classifier (niente
+# feature_selector né scale_features ad ogni valutazione).
+# Risultato: budget NFT torna flat a 300 per tutti i d (5.77 sweep su 36 param).
+PRETRAIN_STEPS = 200    # passi Adam — converge in poche decine su 256 campioni
+PRETRAIN_LR    = 0.01   # LR Adam standard
 
 
 # ---------------------------------------------------------------------------
 # Logging per worker
 # ---------------------------------------------------------------------------
-def get_logger(d: int, seed: int) -> logging.Logger:
+def get_logger(d: int, seed: int, compressor: str) -> logging.Logger:
     os.makedirs("experiments/logs", exist_ok=True)
-    name   = f"worker_d{d}_s{seed}"
+    name   = f"worker_{compressor}_d{d}_s{seed}"
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
@@ -128,25 +124,40 @@ def get_logger(d: int, seed: int) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# Lettura CSV prodotti da test.py
+# Lettura CSV prodotti da test.py (B1) e b2_b3_training.py (B2, B3)
 # ---------------------------------------------------------------------------
-# test.py salva: artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv
-# Colonne: feat_0, feat_1, ..., feat_{d-1}, label
-# Le feature d-dim sono già calcolate: basta leggerle e convertirle in tensor.
-# Nessuna dipendenza da file raw 512-dim — eliminata insieme a HybridModel.
+# Percorsi in COMPRESSOR_PATHS — stessa struttura per tutti e tre.
+# Il rilevamento delle colonne feature usa [c != 'label'] invece di
+# [f"feat_{i}..."] perché B2/B3 usano 'latent_i' mentre B1 usa 'feat_i':
+# entrambi vengono letti correttamente senza dipendere dal naming.
 # ---------------------------------------------------------------------------
-def load_features_from_csv(split: str, d: int, seed: int, device) -> tuple:
+def load_features_from_csv(split: str, d: int, seed: int,
+                            compressor: str, device) -> tuple:
     """
-    Legge le feature PCA d-dim pre-calcolate da test.py.
+    Legge le feature d-dim pre-calcolate per il compressore specificato.
+
+    Args:
+        split:      'train' | 'val' | 'test'
+        d:          dimensione latente (4/8/16/32)
+        seed:       seed (11/17/29)
+        compressor: 'B1' | 'B2' | 'B3'
+        device:     torch.device
 
     Returns:
         u  (Tensor float32, shape (N, d)): feature su device.
         y  (ndarray int64,  shape (N,)  ): label corrispondenti.
     """
-    path = f"artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv"
-    df   = pd.read_csv(path)
+    path = COMPRESSOR_PATHS[compressor].format(split=split, d=d, seed=seed)
 
-    feat_cols = [f"feat_{i}" for i in range(d)]
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"CSV non trovato: {path}\n"
+            f"Per B1: eseguire test.py\n"
+            f"Per B2/B3: eseguire b2_b3_training.py"
+        )
+
+    df        = pd.read_csv(path)
+    feat_cols = [c for c in df.columns if c != 'label']   # funziona con feat_i e latent_i
     features  = df[feat_cols].values.astype(np.float32)
     labels    = df['label'].values.astype(np.int64)
 
@@ -265,31 +276,80 @@ def set_trainable_params(modules: list, flat_params: np.ndarray) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Closure NFT
+# Pre-training di feature_selector con Adam + testa classica temporanea
+# ---------------------------------------------------------------------------
+def pretrain_feature_selector(
+    feature_selector: nn.Module,
+    u_pool:           torch.Tensor,   # (N_pool, d) — pool completo pre-calcolato
+    y_pool:           np.ndarray,     # (N_pool,)
+    criterion,
+    device,
+) -> None:
+    """
+    Ottimizza feature_selector con Adam usando una testa lineare temporanea.
+
+    La testa classica (temp_head) approssima il readout VQC per propagare
+    un gradiente coerente attraverso feature_selector. Viene scartata
+    al termine — serve solo a costruire il segnale di aggiornamento.
+
+    Usa il pool completo (256 campioni, 64/classe) a ogni step per massimizzare
+    la qualità del gradiente. Con Adam e 256 campioni, 200 passi convergono
+    in pochi secondi su CPU.
+
+    Args:
+        feature_selector: nn.Linear(d, N_QUBITS, bias=False) — verrà aggiornato in-place.
+        u_pool:           feature d-dim del pool bilanciato.
+        y_pool:           label corrispondenti.
+        criterion:        CrossEntropyLoss con class weights dal training set.
+        device:           torch.device.
+    """
+    temp_head = nn.Linear(N_QUBITS, N_CLASSES, bias=True).to(device)
+    adam_opt  = torch.optim.Adam(
+        list(feature_selector.parameters()) + list(temp_head.parameters()),
+        lr=PRETRAIN_LR,
+        weight_decay=1e-4,
+    )
+    y_pool_t = torch.tensor(y_pool, dtype=torch.long, device=device)
+
+    feature_selector.train()
+    temp_head.train()
+
+    for _ in range(PRETRAIN_STEPS):
+        adam_opt.zero_grad()
+        u_4     = feature_selector(u_pool)   # (N_pool, d) → (N_pool, 4)
+        u_s     = scale_features(u_4)
+        outputs = temp_head(u_s)
+        loss    = criterion(outputs, y_pool_t)
+        loss.backward()
+        adam_opt.step()
+
+    # temp_head scartata — non viene restituita né salvata
+
+
+# ---------------------------------------------------------------------------
+# Closure NFT — opera su feature già proiettate e scalate (4-dim)
 #
-# modules = [feature_selector, vqc, classifier] — tre oggetti separati,
-# non più un singolo HybridModel che li incapsulava insieme a backbone/PCA
-# inutilizzati.
+# modules = [vqc, classifier] — solo 36 parametri, identici per tutti i d.
+# feature_selector è già stato ottimizzato con Adam e congelato.
+# u_batch_scaled è già 4-dim e già in [0,π] — nessun forward di
+# feature_selector né scale_features nel hot loop NFT.
 # ---------------------------------------------------------------------------
 def make_loss_fn(
-    modules:  list,
-    u_batch:  torch.Tensor,  # (32, d) — batch fresco di questo epoch
-    labels_t: torch.Tensor,  # (32,)
+    modules:        list,
+    u_batch_scaled: torch.Tensor,   # (32, N_QUBITS) — già proiettato e scalato
+    labels_t:       torch.Tensor,   # (32,)
     criterion,
 ) -> callable:
-    feature_selector, vqc, classifier = modules
+    vqc, classifier = modules
 
-    # Closure NFT-compatibile: callable(params: np.ndarray) → float.
     def loss_fn(params: np.ndarray) -> float:
         set_trainable_params(modules, params)
-        for module in modules:
-            module.train()
+        vqc.train()
+        classifier.train()
         with torch.no_grad():
-            u_4      = feature_selector(u_batch)      # d → N_QUBITS
-            u_scaled = scale_features(u_4)
-            q_out    = vqc(u_scaled)
-            outputs  = classifier(q_out)
-            loss     = criterion(outputs, labels_t)
+            q_out   = vqc(u_batch_scaled)
+            outputs = classifier(q_out)
+            loss    = criterion(outputs, labels_t)
         val = float(loss.item())
         return val if np.isfinite(val) else 1e6
 
@@ -304,24 +364,21 @@ def safe_result_fun(result) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation su feature d-dim pre-calcolate — con mini-batch loop
+# Evaluation — opera su feature già proiettate e scalate (4-dim)
 # ---------------------------------------------------------------------------
 def evaluate_on_features(
-    modules:    list,
-    u_d:        torch.Tensor,  # (N, d)
-    labels_np:  np.ndarray,
+    modules:        list,
+    u_4_scaled:     torch.Tensor,   # (N, N_QUBITS) — già proiettato e scalato
+    labels_np:      np.ndarray,
     criterion,
     device,
-    batch_size: int = EVAL_BATCH_SIZE,
+    batch_size:     int = EVAL_BATCH_SIZE,
 ) -> tuple:
-    """Valuta su feature d-dim pre-calcolate processando in mini-batch."""
-    feature_selector, vqc, classifier = modules
-    feature_selector.eval()
+    """Valuta su feature 4-dim pre-proiettate e scalate, in mini-batch."""
+    vqc, classifier = modules
     vqc.eval()
     classifier.eval()
 
-    # Criterion separato con reduction='sum' per aggregazione corretta
-    # tra batch di dimensioni diverse (ultimo batch potrebbe essere più piccolo).
     eval_criterion = nn.CrossEntropyLoss(
         weight=criterion.weight,
         reduction='sum',
@@ -333,15 +390,13 @@ def evaluate_on_features(
 
     with torch.no_grad():
         for start in range(0, n_samples, batch_size):
-            end      = min(start + batch_size, n_samples)
-            u_batch  = u_d[start:end]
-            y_batch  = torch.tensor(labels_np[start:end], dtype=torch.long, device=device)
+            end     = min(start + batch_size, n_samples)
+            u_batch = u_4_scaled[start:end]
+            y_batch = torch.tensor(labels_np[start:end], dtype=torch.long, device=device)
 
-            u_4      = feature_selector(u_batch)
-            u_scaled = scale_features(u_4)
-            q_out    = vqc(u_scaled)
-            outputs  = classifier(q_out)
-            loss     = eval_criterion(outputs, y_batch)
+            q_out   = vqc(u_batch)
+            outputs = classifier(q_out)
+            loss    = eval_criterion(outputs, y_batch)
 
             total_loss += loss.item()
             all_preds.append(torch.argmax(outputs, dim=1).cpu().numpy())
@@ -354,16 +409,17 @@ def evaluate_on_features(
     return avg_loss, acc, macro_f1, per_class_f1
 
 
+
 # ---------------------------------------------------------------------------
 # CSV per-worker
 # ---------------------------------------------------------------------------
-def save_worker_csv(history: list, d: int, seed: int) -> None:
+def save_worker_csv(history: list, d: int, seed: int, compressor: str) -> None:
     os.makedirs("experiments/history", exist_ok=True)
-    path = f"experiments/history/log_d{d}_s{seed}.csv"
+    path = f"experiments/history/log_{compressor}_d{d}_s{seed}.csv"
     pd.DataFrame(
         history,
         columns=[
-            'epoch', 'd', 'seed', 'backbone',
+            'epoch', 'd', 'seed', 'compressor',
             'train_loss',
             'val_loss',  'val_acc',  'val_macro_f1',
             'test_loss', 'test_acc', 'test_macro_f1',
@@ -375,16 +431,10 @@ def save_worker_csv(history: list, d: int, seed: int) -> None:
 # ---------------------------------------------------------------------------
 # Worker — un processo per coppia (d, seed)
 # ---------------------------------------------------------------------------
-def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
+def train_production(d: int, seed: int, compressor: str) -> dict:
     """
-    Addestra feature_selector + VQC + classifier per una coppia (d, seed).
-    Le feature d-dim vengono lette dai CSV prodotti da test.py.
-
-    Nessuna dipendenza da ResNetCompressor/HybridModel: il circuito quantistico
-    e il classificatore lineare vengono costruiti direttamente da
-    QuantumPipeline + DirectVQC, eliminando l'istanziazione ridondante di un
-    backbone ResNet18 completo (~11.2M parametri) e il rifit di una PCA che
-    non venivano mai usati in questo flusso.
+    Addestra feature_selector + VQC + classifier per una tripla (d, seed, compressor).
+    Le feature d-dim vengono lette dal CSV del compressore specificato.
     """
     torch.set_num_threads(1)
     os.environ["OMP_NUM_THREADS"]      = "1"
@@ -392,29 +442,29 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
     device = torch.device("cpu")
-    logger = get_logger(d, seed)
-    logger.info(f"Avvio job d={d} seed={seed} backbone={backbone}")
+    logger = get_logger(d, seed, compressor)
+    logger.info(f"Avvio job d={d} seed={seed} compressor={compressor}")
 
-    # — Caricamento feature da CSV (prodotti da test.py) ---------------------
+    # — Caricamento feature da CSV -------------------------------------------
     try:
-        u_train, y_train = load_features_from_csv('train', d, seed, device)
-        u_val,   y_val   = load_features_from_csv('val',   d, seed, device)
-        u_test,  y_test  = load_features_from_csv('test',  d, seed, device)
+        u_train, y_train = load_features_from_csv('train', d, seed, compressor, device)
+        u_val,   y_val   = load_features_from_csv('val',   d, seed, compressor, device)
+        u_test,  y_test  = load_features_from_csv('test',  d, seed, compressor, device)
         logger.info(
-            f"Feature caricate da CSV: "
+            f"Feature caricate ({compressor}): "
             f"train {tuple(u_train.shape)} | "
             f"val {tuple(u_val.shape)} | "
             f"test {tuple(u_test.shape)}"
         )
         print(
-            f"[d={d} s={seed}] CSV letti: "
+            f"[{compressor} d={d} s={seed}] CSV letti: "
             f"train {tuple(u_train.shape)} | "
             f"val {tuple(u_val.shape)} | "
             f"test {tuple(u_test.shape)}",
             flush=True,
         )
     except FileNotFoundError as e:
-        logger.error(f"CSV non trovato: {e}\nEseguire prima test.py!")
+        logger.error(str(e))
         raise
     except Exception:
         logger.error(traceback.format_exc())
@@ -461,42 +511,68 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         raise
 
     # — Feature selector: proiezione trainabile d → N_QUBITS -----------------
+    # Ottimizzato con Adam (backprop) PRIMA del training NFT, poi congelato.
+    # Questo separa i due problemi per natura dell'ottimizzatore:
+    #   Adam → 128 param (d=32) o 16 param (d=4), gestisce entrambi in modo
+    #          equivalente grazie al gradiente esatto — d=32 atteso ≥ d=4.
+    #   NFT  → sempre 36 param (VQC+classifier), indipendente da d.
     feature_selector = nn.Linear(d, N_QUBITS, bias=False).to(device)
     nn.init.orthogonal_(feature_selector.weight)
 
-    modules = [feature_selector, vqc, classifier]
-
-    n_fs    = sum(p.numel() for p in feature_selector.parameters() if p.requires_grad)
-    n_vc    = sum(
+    n_fs = sum(p.numel() for p in feature_selector.parameters())
+    n_vc = sum(
         p.numel()
         for module in (vqc, classifier)
         for p in module.parameters()
         if p.requires_grad
     )
-    n_total = n_fs + n_vc
-
-    if n_total == 0:
-        raise RuntimeError(
-            f"d={d} seed={seed}: nessun parametro trainable trovato "
-            f"(feature_selector={n_fs}, vqc+classifier={n_vc}). "
-            "Verificare requires_grad sui moduli."
-        )
-
     logger.info(
-        f"Parametri: feature_selector={n_fs} (d={d}×{N_QUBITS}) | "
-        f"VQC+classifier={n_vc} | totale={n_total}"
+        f"Parametri: feature_selector={n_fs} (d={d}×{N_QUBITS}, Adam) | "
+        f"VQC+classifier={n_vc} (NFT)"
     )
     print(
-        f"[d={d} s={seed}] parametri: fs={n_fs} | vqc+clf={n_vc} | tot={n_total}",
+        f"[d={d} s={seed}] param: fs={n_fs} (Adam) | vqc+clf={n_vc} (NFT)",
         flush=True,
     )
 
-    # — NFT ------------------------------------------------------------------
-    # Budget scalato sul numero di parametri trainabili (n_total) — vedi
-    # get_max_evals_nft per la motivazione. Per d<=16 coincide con il
-    # precedente valore fisso (300); solo d=32 ottiene un budget maggiore.
-    max_evals = get_max_evals_nft(n_total)
-    optimizer = NFT(maxfev=max_evals)
+    # — Pre-training feature_selector con Adam --------------------------------
+    try:
+        pretrain_feature_selector(feature_selector, u_pool, y_pool, criterion, device)
+        logger.info(f"Pre-training feature_selector completato ({PRETRAIN_STEPS} step Adam)")
+        print(f"[d={d} s={seed}] pre-training Adam completato", flush=True)
+    except Exception:
+        logger.error(f"Errore pre-training:\n{traceback.format_exc()}")
+        raise
+
+    # Congela feature_selector — NFT non lo toccherà più
+    for p in feature_selector.parameters():
+        p.requires_grad = False
+
+    # — Pre-proiezione di pool, val, test (UNA SOLA VOLTA) -------------------
+    # feature_selector è congelato: le feature 4-dim scalate sono deterministiche.
+    # Il hot loop NFT chiama solo vqc + classifier — zero overhead di proiezione.
+    with torch.no_grad():
+        u_pool_4s = scale_features(feature_selector(u_pool))  # (N_pool, 4)
+        u_val_4s  = scale_features(feature_selector(u_val))   # (N_val,  4)
+        u_test_4s = scale_features(feature_selector(u_test))  # (N_test, 4)
+    logger.info(
+        f"Feature pre-proiettate: pool {tuple(u_pool_4s.shape)} | "
+        f"val {tuple(u_val_4s.shape)} | test {tuple(u_test_4s.shape)}"
+    )
+
+    # modules NFT: solo VQC + classifier (36 parametri, identici per tutti i d)
+    modules_nft = [vqc, classifier]
+
+    if n_vc == 0:
+        raise RuntimeError(
+            f"d={d} seed={seed}: nessun parametro trainable per NFT "
+            f"(vqc+classifier={n_vc}). Verificare requires_grad."
+        )
+
+    # — NFT — budget flat 300 per tutti i d (5.77 sweep su 36 param) ---------
+    # Non serve più scalare il budget con d: feature_selector è già ottimizzato
+    # e congelato, NFT opera sempre sugli stessi 36 parametri.
+    optimizer = NFT(maxfev=MAX_EVALS_NFT)
     epoch_rng = np.random.default_rng(seed)
 
     best_val_macro_f1  = 0.0
@@ -506,36 +582,38 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     history            = []
     os.makedirs("experiments/models", exist_ok=True)
 
+    n_sweeps = MAX_EVALS_NFT / n_vc
     print(
-        f">>> NFT: {backbone.upper()} | d={d} seed={seed} | "
-        f"maxfev={max_evals} ({max_evals/n_total:.1f} sweep) | patience={PATIENCE}",
+        f">>> NFT [{compressor}]: d={d} seed={seed} | "
+        f"maxfev={MAX_EVALS_NFT} ({n_sweeps:.1f} sweep su {n_vc} param) | patience={PATIENCE}",
         flush=True,
     )
     logger.info(
-        f"Inizio training NFT maxfev={max_evals} "
-        f"({max_evals/n_total:.1f} sweep su {n_total} param) patience={PATIENCE}"
+        f"Inizio NFT maxfev={MAX_EVALS_NFT} "
+        f"({n_sweeps:.1f} sweep su {n_vc} param) patience={PATIENCE}"
     )
 
     for epoch in range(EPOCHS):
         t0 = time.time()
 
         try:
-            u_batch, y_batch_np = sample_balanced_batch(
-                u_pool, y_pool, SAMPLES_PER_CLASS, epoch_rng
+            # Campiona batch dal pool già pre-proiettato e scalato (4-dim)
+            u_batch_4s, y_batch_np = sample_balanced_batch(
+                u_pool_4s, y_pool, SAMPLES_PER_CLASS, epoch_rng
             )
             y_batch_t = torch.tensor(y_batch_np, dtype=torch.long, device=device)
 
-            loss_fn = make_loss_fn(modules, u_batch, y_batch_t, criterion)
+            loss_fn = make_loss_fn(modules_nft, u_batch_4s, y_batch_t, criterion)
             result  = optimizer.minimize(
-                fun=loss_fn, x0=get_trainable_params(modules)
+                fun=loss_fn, x0=get_trainable_params(modules_nft)
             )
-            set_trainable_params(modules, result.x)
+            set_trainable_params(modules_nft, result.x)
 
             val_loss,  val_acc,  val_macro_f1,  _            = evaluate_on_features(
-                modules, u_val,  y_val,  criterion, device
+                modules_nft, u_val_4s,  y_val,  criterion, device
             )
             test_loss, test_acc, test_macro_f1, per_class_f1 = evaluate_on_features(
-                modules, u_test, y_test, criterion, device
+                modules_nft, u_test_4s, y_test, criterion, device
             )
 
         except Exception:
@@ -545,7 +623,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
                 flush=True,
             )
             history.append([
-                epoch+1, d, seed, backbone,
+                epoch+1, d, seed, compressor,
                 float('nan'),
                 float('nan'), float('nan'), float('nan'),
                 float('nan'), float('nan'), float('nan'), '[]',
@@ -574,7 +652,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
             best_test_macro_f1 = test_macro_f1
             best_loss          = train_loss
             patience_ctr       = 0
-            ckpt_path = f"experiments/models/best_vqc_{backbone}_d{d}_seed{seed}.pth"
+            ckpt_path = f"experiments/models/best_vqc_{compressor}_d{d}_seed{seed}.pth"
             try:
                 # Salva solo i tre moduli realmente trainabili.
                 # Niente più pesi ResNet18 frozen inclusi per errore nel
@@ -582,7 +660,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
                 # model.state_dict() di HybridModel).
                 torch.save(
                     {
-                        'feature_selector': feature_selector.state_dict(),
+                        'feature_selector': feature_selector.state_dict(),  # congelato, ottimizzato Adam
                         'vqc':              vqc.state_dict(),
                         'classifier':       classifier.state_dict(),
                         'd':                d,
@@ -608,7 +686,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
                     flush=True,
                 )
                 history.append([
-                    epoch+1, d, seed, backbone,
+                    epoch+1, d, seed, compressor,
                     train_loss,
                     val_loss,  val_acc,  val_macro_f1,
                     test_loss, test_acc, test_macro_f1,
@@ -617,7 +695,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
                 break
 
         history.append([
-            epoch+1, d, seed, backbone,
+            epoch+1, d, seed, compressor,
             train_loss,
             val_loss,  val_acc,  val_macro_f1,
             test_loss, test_acc, test_macro_f1,
@@ -625,7 +703,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
         ])
 
     try:
-        save_worker_csv(history, d, seed)
+        save_worker_csv(history, d, seed, compressor)
     except Exception:
         logger.error(f"Errore CSV:\n{traceback.format_exc()}")
 
@@ -647,7 +725,7 @@ def train_production(d: int, seed: int, backbone: str = BACKBONE) -> dict:
     return {
         "d":                  d,
         "seed":               seed,
-        "backbone":           backbone,
+        "compressor":         compressor,
         "best_loss":          best_loss,
         "best_val_macro_f1":  best_val_macro_f1,
         "best_test_macro_f1": best_test_macro_f1,
@@ -664,32 +742,31 @@ def main():
     os.makedirs("experiments/logs",    exist_ok=True)
     os.makedirs("experiments/history", exist_ok=True)
 
-    jobs = [(d, s, BACKBONE) for d in DIMS for s in SEEDS]
+    jobs = [(d, s, c) for c in COMPRESSORS for d in DIMS for s in SEEDS]
 
     print(f"[INFO] Avvio {len(jobs)} job su {MAX_WORKERS} processi paralleli...")
+    print(f"[INFO] Compressori: {COMPRESSORS} | Dimensioni: {DIMS} | Seed: {SEEDS}")
     print(
-        f"[INFO] NFT | maxfev base={MAX_EVALS_NFT}, scalato a {NFT_TARGET_SWEEPS} "
-        f"sweep min. per d grandi (vedi get_max_evals_nft) | "
-        f"epochs={EPOCHS} | patience={PATIENCE}"
+        f"[INFO] Fase 1 — Adam pre-training feature_selector: {PRETRAIN_STEPS} step, lr={PRETRAIN_LR}"
+    )
+    print(
+        f"[INFO] Fase 2 — NFT su VQC+classifier: maxfev={MAX_EVALS_NFT} (36 param fissi, "
+        f"{MAX_EVALS_NFT/36:.1f} sweep) | epochs={EPOCHS} | patience={PATIENCE}"
     )
     print(
         f"[INFO] feature_selector d→{N_QUBITS} | "
-        f"pool={SAMPLES_POOL_PER_CLASS}/classe | batch={SAMPLES_PER_CLASS}/classe"
+        f"pool={SAMPLES_POOL_PER_CLASS}/classe | batch={SAMPLES_PER_CLASS}/classe\n"
     )
-    print(f"[INFO] Feature lette da: artifacts/sweep/B1_pca_{{split}}_d{{d}}_seed{{seed}}.csv")
-    print(f"[INFO] Nessun backbone ResNet/PCA istanziato a runtime — solo VQC diretto.\n")
 
     all_results = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Variabile di loop rinominata `bb` per evitare lo shadowing
-        # della costante globale BACKBONE.
         futures = {
-            executor.submit(train_production, d, s, bb): (d, s, bb)
-            for d, s, bb in jobs
+            executor.submit(train_production, d, s, c): (d, s, c)
+            for d, s, c in jobs
         }
         for future in as_completed(futures):
-            d, s, bb = futures[future]
+            d, s, c = futures[future]
             try:
                 result = future.result(timeout=JOB_TIMEOUT_SEC)
                 all_results.append(result)
@@ -699,7 +776,7 @@ def main():
                     else "nan"
                 )
                 print(
-                    f"[DONE] d={d} s={s} → "
+                    f"[DONE] {c} d={d} s={s} → "
                     f"val F1: {result['best_val_macro_f1']:.4f} | "
                     f"test F1: {result['best_test_macro_f1']:.4f} | "
                     f"loss: {best_loss_str}",
@@ -707,28 +784,28 @@ def main():
                 )
             except TimeoutError:
                 print(
-                    f"[TIMEOUT] d={d} s={s} → limite {JOB_TIMEOUT_SEC // 3600}h",
+                    f"[TIMEOUT] {c} d={d} s={s} → limite {JOB_TIMEOUT_SEC // 3600}h",
                     flush=True,
                 )
             except Exception:
                 print(
-                    f"[ERROR] d={d} s={s} →\n{traceback.format_exc()}",
+                    f"[ERROR] {c} d={d} s={s} →\n{traceback.format_exc()}",
                     flush=True,
                 )
 
     if all_results:
         df = pd.DataFrame(all_results)
-        df = df[['d', 'seed', 'backbone', 'best_loss',
+        df = df[['compressor', 'd', 'seed', 'best_loss',
                  'best_val_macro_f1', 'best_test_macro_f1']]
         df = df.sort_values(
-            ["d", "seed"], ascending=[False, True]
+            ["compressor", "d", "seed"], ascending=[True, False, True]
         ).reset_index(drop=True)
         df.to_csv("experiments/production_summary.csv", index=False)
 
         history_files = [
-            f"experiments/history/log_d{d}_s{s}.csv"
-            for d, s, _ in jobs
-            if os.path.exists(f"experiments/history/log_d{d}_s{s}.csv")
+            f"experiments/history/log_{c}_d{d}_s{s}.csv"
+            for c, d, s in [(c, d, s) for c in COMPRESSORS for d in DIMS for s in SEEDS]
+            if os.path.exists(f"experiments/history/log_{c}_d{d}_s{s}.csv")
         ]
         if history_files:
             pd.concat(
