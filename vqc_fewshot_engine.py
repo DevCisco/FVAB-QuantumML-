@@ -131,7 +131,7 @@ class ParameterShiftFunction(torch.autograd.Function):
     --------
     Per ogni peso θ_k costruisce 2 PUBs shifted (θ_k ± π/2) per ogni
     campione, li esegue tutti in un unico run(), calcola il gradiente:
-        ∂L/∂θ_k = Σ_i (∂L/∂⟨O_i⟩) × [⟨O_i⟩(+) - ⟨O_i⟩(-)] / 2
+        ∂L/∂θ_k = Σ_i (∂L/∂⟨O_i⟩) x [⟨O_i⟩(+) - ⟨O_i⟩(-)] / 2
 
     Il gradiente rispetto a x (input) non viene calcolato (backbone
     congelato): restituisce None per input_vals.

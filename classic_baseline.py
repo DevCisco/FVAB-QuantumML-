@@ -70,19 +70,6 @@ def get_logger(d: int, seed: int, compressor: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 # Caricamento feature pre-salvate da test.py (B1) / b2_b3_training.py (B2, B3)
 #
-# FIX rispetto alla versione precedente: il path era hardcoded su
-# "B1_pca_{split}_d{d}_seed{seed}.csv" — la baseline classica confrontava
-# quindi SEMPRE e SOLO PCA, anche se il progetto richiede lo stesso
-# screening per tutti e tre i compressori (coerentemente con
-# master_sweep_team_b.py e train_vqc_production.py, entrambi già estesi a
-# B1/B2/B3). Ora il compressore è un parametro esplicito.
-#
-# Vantaggio strutturale vs VQC, invariato: il modello classico usa tutte
-# le d componenti compresse. Il VQC è limitato a min(d, n_qubit)=4 feature
-# per singolo blocco di encoding (compensato dal re-uploading multi-ciclo,
-# non da questo script). Questo rende il confronto favorevole al classico
-# per costruzione — se il VQC regge comunque, è un risultato forte.
-#
 # Colonne CSV: feat_0..feat_{d-1} (B1) oppure latent_0..latent_{d-1} (B2/B3),
 # label. Il filtro [c != 'label'] gestisce entrambe le convenzioni di nome
 # senza bisogno di distinguerle esplicitamente.
@@ -466,8 +453,6 @@ def main():
     os.makedirs("experiments_classical/history", exist_ok=True)
     os.makedirs("experiments_classical",         exist_ok=True)
 
-    # FIX: prima solo [(d, s) for d in DIMS for s in SEEDS] su B1 —
-    # ora tutti e tre i compressori, 36 job totali (era 12).
     jobs = [(d, s, c) for c in COMPRESSORS for d in DIMS for s in SEEDS]
 
     print(f"[INFO] Avvio {len(jobs)} job su {MAX_WORKERS} processi paralleli...")

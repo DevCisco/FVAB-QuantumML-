@@ -17,25 +17,20 @@ class QuantumPipeline:
         sugli STESSI QUBIT e si alternano blocchi di encoding e blocchi
         variazionali."
 
-    Il documento non specifica esplicitamente se i pesi variazionali
-    debbano essere condivisi o indipendenti tra i cicli -- e un grado di
-    liberta lasciato aperto all'interno dell'interfaccia congelata.
-    Entrambe le scelte sono quindi ugualmente conformi.
-
-    STORIA DELLA DECISIONE (per trasparenza in relazione):
-    E stata testata anche la variante a pesi CONDIVISI tra i cicli (stesso
+    STORIA DELLA DECISIONE:
+    E' stata testata anche la variante a pesi CONDIVISI tra i cicli (stesso
     ParameterVector "theta" riusato ad ogni blocco -- lo schema del paper
     Perez-Salinas et al., citato dal documento come riferimento per
     l'encoding). Verificato con un test diagnostico dedicato che il
     conteggio dei parametri nel circuito coincideva esattamente con quello
     atteso (nessun bug di implementazione in qc.compose()). Empiricamente,
-    pero, i pesi condivisi hanno PEGGIORATO le prestazioni rispetto ai pesi
+    però, i pesi condivisi hanno PEGGIORATO le prestazioni rispetto ai pesi
     indipendenti (macro-F1 test sceso a 0.08-0.31, sotto il livello
     casuale) -- costringere lo stesso piccolo set di parametri a funzionare
     bene su blocchi di feature statisticamente diversi (specialmente a
     d=32, dove lo stesso blocco deve adattarsi a 8 segmenti diversi del
-    vettore compresso) si e rivelato un vincolo piu difficile da
-    soddisfare per NFT, non piu facile.
+    vettore compresso) si è rivelato un vincolo piu difficile da
+    soddisfare per NFT, non più facile.
 
     SCELTA FINALE: pesi INDIPENDENTI per ciclo (un ParameterVector "theta"
     di lunghezza n_cycles * parametri_per_blocco). Il numero di parametri
@@ -63,7 +58,7 @@ class QuantumPipeline:
         # parametri di encoding: uno per ogni slot (reale o di padding)
         self.features = ParameterVector("u", self.n_encoding_padded)
 
-        # template ansatz -- la STRUTTURA e identica per ogni ciclo, ma
+        # template ansatz -- la STRUTTURA è identica per ogni ciclo, ma
         # ogni ciclo ha i SUOI parametri indipendenti (vedi build_circuit).
         self._ansatz_template = RealAmplitudes(
             num_qubits=n_qubits,

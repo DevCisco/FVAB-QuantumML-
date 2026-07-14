@@ -5,15 +5,6 @@ Sweep few-shot: LogisticRegression + VQC su frazioni decrescenti del
 training set (25%, 10%, 5%), per tutti e tre i compressori B1/B2/B3,
 dimensioni D=[8,4], seed=[11].
 
-FIX rispetto alla versione precedente: quella dipendeva da
-vqc_fewshot_engine.train_vqc, un modulo esterno mai allineato ai fix
-applicati a train_vqc_production.py (rimozione di feature_selector,
-introduzione del data re-uploading, scaler fit-on-train) — avrebbe
-addestrato un VQC strutturalmente DIVERSO da quello usato ovunque altrove
-nel progetto, rendendo il confronto few-shot non comparabile col resto
-dei risultati. Inoltre copriva solo B1 (non B2/B3) e misurava accuracy su
-soli 400 campioni di test invece di macro-F1 sul test set fisso completo.
-
 Questa versione riusa DIRETTAMENTE i building block già validati di
 train_vqc_production.py (QuantumPipeline, DirectVQC, scaler fit-on-train,
 NFT, budget scalato) — stessa architettura, stesso encoding, stesso

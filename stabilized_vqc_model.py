@@ -15,10 +15,6 @@ class StabilizedVQC(nn.Module):
         # 1. Creazione Circuito
         circuit, input_params = create_vqc_circuit(n_qubits, d_latent, reps=1)
 
-        # FIX B: circuit.parameters restituisce un ParameterView che è un SET non
-        # ordinato — non supporta slicing e l'ordine è arbitrario.
-        # Separiamo esplicitamente input params (prefisso 'x[') da weight params
-        # (prefisso 'theta_l'), poi ordiniamo numericamente ciascun gruppo.
         all_params = circuit.parameters
 
         input_params_sorted = sorted(
@@ -47,9 +43,6 @@ class StabilizedVQC(nn.Module):
         # 4. Connector PyTorch
         self.qnn_layer = TorchConnector(qnn)
 
-        # FIX C: nn.Linear(1, 4) è sbagliato — il QNN con n_qubits osservabili
-        # produce output di shape (batch, n_qubits), non (batch, 1).
-        # Con n_qubits=4 il layer deve essere Linear(4, 4).
         self.post_processing = nn.Linear(n_qubits, 4)
 
     def forward(self, x):

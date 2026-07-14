@@ -4,7 +4,7 @@ master_sweep_team_b.py
 Confronto sistematico dei tre compressori B1/B2/B3 con il protocollo di
 screening classico richiesto dal documento di progetto: LogisticRegression,
 MLP (un hidden layer), RBF-SVM — con selezione formale del comparatore
-primario su solo validation set, congelato dopo la selezione.
+primario su solo validation set, non modificabile dopo la selezione.
 
 Prerequisiti — questi file devono esistere prima di eseguire questo script:
   • B1: artifacts/sweep/B1_pca_{split}_d{d}_seed{seed}.csv  → test.py

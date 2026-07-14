@@ -49,9 +49,7 @@ class DirectVQC(nn.Module):
         ]
 
         # pesi variazionali come parametro PyTorch ottimizzabile
-        # Init U(-0.01, 0.01) — richiesta dal contratto di training congelato
-        # del documento iniziale (sezione 3): "Inizializzazione*: Parametri
-        # circuitali ~ U(-0.01, 0.01)". FIX: era init a zero.
+        # Init U(-0.01, 0.01) — permette di partire vicino a 0 e quindi vicino a identità, utile per l'ottimizzazione.
         self.qweights = nn.Parameter(
             (torch.rand(self._weight_len, dtype=torch.float32) * 2 - 1) * 0.01
         )

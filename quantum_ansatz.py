@@ -15,7 +15,6 @@ def create_vqc_circuit(n_qubits, d_latent, reps=1):
                 circuit.ry(x[param_idx], i)
                 param_idx += 1
 
-        # FIX A: la stima originale "2 * n_qubits * reps" è sbagliata per reps > 1.
         # RealAmplitudes con entanglement='linear' ha esattamente
         # n_qubits * (reps + 1) parametri. Usiamo l'attributo reale del circuito
         # per non dipendere da nessuna formula manuale.

@@ -54,12 +54,7 @@ COMPRESSOR_PATHS = {
 
 N_CLASSES              = 4
 N_QUBITS                = N_CLASSES   # N_QUBITS = N_CLASSES: i readout VQC sono i logit
-# RealAmplitudes reps per blocco di re-upload. Era 3, ora 2 — allineato alla
-# raccomandazione del documento iniziale ("Entangling budget suggerito":
-# al massimo due layer entanglianti per l'ansatz condiviso). Con reps=2:
-# 4*(2+1)=12 pesi per blocco. Da quando i pesi sono CONDIVISI tra i cicli
-# di re-upload (vedi quantum_model.py), questo è anche il numero TOTALE
-# di pesi variazionali del VQC, indipendente da d_latent.
+
 N_LAYERS                = 2
 SAMPLES_PER_CLASS       = 8
 SAMPLES_POOL_PER_CLASS  = 64
@@ -67,21 +62,7 @@ SAMPLES_POOL_PER_CLASS  = 64
 EVAL_BATCH_SIZE = 512
 JOB_TIMEOUT_SEC = 8 * 3600
 
-# ---------------------------------------------------------------------------
-# Range di scaling per l'encoding angolare RY.
-#
-# Il documento iniziale specifica letteralmente [0, 2π]. Con un singolo
-# RY(θ), però, l'expectation value <Z> = cos(θ) NON è iniettivo su [0,2π]:
-# θ=0.5 e θ=2π-0.5 producono lo STESSO <Z>=cos(0.5)=0.8776 — due valori di
-# feature distinti diventano indistinguibili per il circuito. Con [0,π],
-# cos(θ) è strettamente monotona (iniettiva).
-#
-# Evidenza empirica: con [0,2π] la macro-F1 di test è crollata di 25-30
-# punti su tutti i compressori (B1/B2/B3) in una run precedente. Default
-# qui: π. Cambiare a `2 * np.pi` per testare la lettura letterale del
-# documento nel contesto del nuovo circuito multi-ciclo (ogni ciclo
-# applica lo STESSO ansatz condiviso — resta da verificare empiricamente
-# se questo disambigua parzialmente il fold di cos(θ), non è assunto).
+
 ENCODING_SCALE_MAX = 2 * np.pi
 
 
@@ -168,13 +149,7 @@ def load_features_from_csv(split: str, d: int, seed: int, compressor: str) -> tu
 
 # ---------------------------------------------------------------------------
 # Scaler min-max fittato SOLO su train, applicato identicamente a val/test
-#
-# FIX rispetto alla versione precedente: lo scaling era per-CAMPIONE (ogni
-# vettore scalato sul proprio min/max) — non un vero scaler fittato sul
-# training set come richiesto dal documento ("Scaling: min-max su train",
-# "Applicazione scaling: stesso scaler applicato a val/test", lo stesso
-# principio già usato per PCA/AE). Ora è un vero scaler globale PER-FEATURE
-# (una coppia min/max per ciascuna delle d dimensioni, calcolata sul train).
+# Permette di evitare che feature costanti (min=max) generino NaN o infiniti.
 # ---------------------------------------------------------------------------
 def fit_scaler(u_train: np.ndarray) -> tuple:
     """Calcola min/max per-feature sul training set. Returns (min_vec, max_vec), shape (d,)."""

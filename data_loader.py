@@ -35,7 +35,7 @@ def get_data_loaders(seed, batch_size=128, resize=224, split_dir="dataset_splits
     ------------------------------------
     1. Test fisso → la varianza inter-seed riflette solo la stabilità del modello
        (quale subset di training viene selezionato), non la difficoltà del test set.
-       Con protocollo corretto, la varianza attesa è ~2–5% macro-F1, non ~11%.
+       Con protocollo corretto, la varianza attesa è ~2-5% macro-F1, non ~11%.
 
     2. Nessun data leakage dal backbone → i pesi MedMNIST vengono da un ResNet
        addestrato sul canonical OCTMNIST train split. Il test fisso (canonical val
@@ -58,8 +58,6 @@ def get_data_loaders(seed, batch_size=128, resize=224, split_dir="dataset_splits
             transforms.Normalize(mean=NORM_MEAN, std=NORM_STD),
         ])
 
-    # ConcatDataset identico alla versione precedente — gli indici nei CSV
-    # sono riferiti a questo dataset concatenato e rimangono compatibili.
     full_train   = OCTMNIST(split='train', transform=transform, download=True, as_rgb=True)
     full_val     = OCTMNIST(split='val',   transform=transform, download=True, as_rgb=True)
     full_test    = OCTMNIST(split='test',  transform=transform, download=True, as_rgb=True)
@@ -74,7 +72,6 @@ def get_data_loaders(seed, batch_size=128, resize=224, split_dir="dataset_splits
             os.path.join(split_dir, f"val_ids_{seed}.csv")
         )["sample_index"].tolist()
 
-        # FIX: test_ids_fixed.csv — stesso file per tutti i seed
         test_ids = pd.read_csv(
             os.path.join(split_dir, "test_ids_fixed.csv")
         )["sample_index"].tolist()
