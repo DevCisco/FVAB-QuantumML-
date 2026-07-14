@@ -191,7 +191,7 @@ Nessuna dipendenza da `HybridModel` o da un `feature_selector`: il circuito cons
 
 | Scelta | Valore | Perché |
 |:---|:---|:---|
-| `ENCODING_SCALE_MAX` | `2π` — decisione finale | `RY(θ)` applicato a |0> traccia un percorso sul meridiano della sfera di Bloch: a `θ=0` sei al polo nord (|0⟩), a `θ=π` al polo sud (|1⟩), a `θ=2π` sei tornato al polo nord. Visivamente, `2π` corrisponde a "un giro completo" — è la scelta intuitiva se si pensa alla rotazione come un cerchio da percorrere per intero, senza fare il conto specifico su cosa succede alla misura di `⟨Z⟩` lungo il percorso.. |
+| `ENCODING_SCALE_MAX` | `2π` — decisione finale | `RY(θ)` applicato a `\|0>` traccia un percorso sul meridiano della sfera di Bloch: a `θ=0` sei al polo nord (|0⟩), a `θ=π` al polo sud (|1⟩), a `θ=2π` sei tornato al polo nord. Visivamente, `2π` corrisponde a "un giro completo" — è la scelta intuitiva se si pensa alla rotazione come un cerchio da percorrere per intero, senza fare il conto specifico su cosa succede alla misura di `⟨Z⟩` lungo il percorso.. |
 | Pesi ansatz **indipendenti** per ciclo — decisione finale | — | Variante a pesi condivisi testata e scartata: tecnicamente corretta ma empiricamente sotto il livello casuale. |
 | `N_LAYERS = 2` | RealAmplitudes reps, per singolo blocco | Allineato al budget di entangling suggerito dal documento, interpretato per-blocco (unica lettura compatibile col re-uploading). |
 | `get_max_evals_nft` | scala con `n_param` | I parametri crescono con `d` (più cicli). Budget NFT scalato di conseguenza, floor a 300. |
