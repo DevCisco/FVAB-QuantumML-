@@ -320,7 +320,7 @@ Sintomo di un percorso di codice legacy basato su QN-SPSA. La pipeline corrente 
 Eseguire prima `b2_b3_training.py` — salva sia le feature CSV sia i pesi del modello.
 
 **Macro-F1 del VQC vicina al caso casuale (~0.25)**
-Verificare `ENCODING_SCALE_MAX = np.pi` (non `2*np.pi`) e che i pesi ansatz siano indipendenti per ciclo (non condivisi) in `quantum_model.py` — entrambe le alternative sono state testate ed empiricamente scartate in via definitiva.
+Verificare `ENCODING_SCALE_MAX = 2* np.pi` (non `np.pi`) e che i pesi ansatz siano indipendenti per ciclo (non condivisi) in `quantum_model.py` — entrambe le alternative sono state testate ed empiricamente scartate in via definitiva.
 
 **`team_b_comparison.csv` sembra contenere dati di un modello diverso da LogisticRegression**
 Verificare di usare la versione corrente di `master_sweep_team_b.py` — un bug precedente scriveva lì il comparatore selezionato dallo screening (es. MLP) invece della LR obbligatoria. Corretto: ora sono file separati (vedi Sezione 7).
