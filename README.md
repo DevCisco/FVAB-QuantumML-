@@ -8,14 +8,13 @@
 4. [Ordine di esecuzione](#ordine-di-esecuzione)
    - [1. `generate_splits.py`](#1-generate_splitspy--prerequisito)
    - [2. `test.py`](#2-testpy)
-   - [3. `save_raw_features.py`](#3-save_raw_featurespy--opzionale)
-   - [4. `b2_b3_training.py`](#4-b2_b3_trainingpy)
-   - [5. `train_vqc_production.py`](#5-train_vqc_productionpy--pipeline-principale)
-   - [6. `classical_baseline.py`](#6-classical_baselinepy--baseline-di-confronto)
-   - [7. `master_sweep_team_b.py`](#7-master_sweep_team_bpy--ablation-no-quantum--confronto-compressori)
-   - [8. `week8_evaluation.py`](#8-week8_evaluationpy)
-   - [9. `execute_week_7.py`](#9-execute_week_7py)
-   - [10. `week4_sweep_production.py`](#10-week4_sweep_productionpy--indipendente)
+   - [3. `b2_b3_training.py`](#3-b2_b3_trainingpy)
+   - [4. `train_vqc_production.py`](#4-train_vqc_productionpy--pipeline-principale)
+   - [5. `classical_baseline.py`](#5-classical_baselinepy--baseline-di-confronto)
+   - [6. `master_sweep_team_b.py`](#6-master_sweep_team_bpy--ablation-no-quantum--confronto-compressori)
+   - [7. `week8_evaluation.py`](#7-week8_evaluationpy)
+   - [8. `execute_week_7.py`](#8-execute_week_7py)
+   - [9. `week4_sweep_production.py`](#9-week4_sweep_productionpy--indipendente)
 5. [Deliverable finale](#deliverable-finale)
 6. [Stato dei risultati](#stato-dei-risultati)
 7. [Mappa rapida script → output](#mappa-rapida-script--output)
@@ -91,14 +90,13 @@ python -m pip install torch torchvision --index-url https://download.pytorch.org
 |:-:|:-------|:-----|
 | 1 | `generate_splits.py` | ⚠️ Prerequisito — vedi nota sotto |
 | 2 | `test.py` | Produce le feature B1 (PCA) |
-| 3 | `save_raw_features.py` | Opzionale |
-| 4 | `b2_b3_training.py` | Produce le feature B2/B3 (AE) |
-| 5 | `train_vqc_production.py` | VQC con re-uploading + NFT — **pipeline principale** |
-| 6 | `classical_baseline.py` | Baseline MLP few-shot (batch fisso, stesso regime dati del VQC) |
-| 7 | `master_sweep_team_b.py` | Ablation no-quantum + screening LR/MLP/RBF-SVM |
-| 8 | `week8_evaluation.py` | Valutazione pulita multi-split, tutti i compressori |
-| 9 | `execute_week_7.py` | Sweep few-shot (LR + VQC) |
-| 10 | `week4_sweep_production.py` | StabilizedVQC, backpropagation classica (indipendente) |
+| 3 | `b2_b3_training.py` | Produce le feature B2/B3 (AE) |
+| 4 | `train_vqc_production.py` | VQC con re-uploading + NFT — **pipeline principale** |
+| 5 | `classical_baseline.py` | Baseline MLP few-shot (batch fisso, stesso regime dati del VQC) |
+| 6 | `master_sweep_team_b.py` | Ablation no-quantum + screening LR/MLP/RBF-SVM |
+| 7 | `week8_evaluation.py` | Valutazione pulita multi-split, tutti i compressori |
+| 8 | `execute_week_7.py` | Sweep few-shot (LR + VQC) |
+| 9 | `week4_sweep_production.py` | StabilizedVQC, backpropagation classica (indipendente) |
 
 ---
 
@@ -130,13 +128,7 @@ Estrae embedding ResNet18 (512-dim) e li riduce con PCA per ogni `(d, seed)`, `d
 
 ---
 
-### 3. `save_raw_features.py` — opzionale
-
-Salva **solo** lo split `train` delle feature raw 512-dim. Ridondante rispetto a `test.py`, utile solo per rigenerare le feature di training senza rifare l'intera pipeline PCA.
-
----
-
-### 4. `b2_b3_training.py`
+### 3. `b2_b3_training.py`
 
 Addestra **B2 (VanillaAE)** e **B3 (RegularizedAE)**.
 
@@ -155,7 +147,7 @@ Addestra **B2 (VanillaAE)** e **B3 (RegularizedAE)**.
 
 ---
 
-### 5. `train_vqc_production.py` — pipeline principale
+### 4. `train_vqc_production.py` — pipeline principale
 
 Addestra il VQC per ogni combinazione `(d, seed, compressore)` — 36 job totali. Legge le feature direttamente dai CSV di `test.py`/`b2_b3_training.py`: nessuna dipendenza da ResNet18/PCA a runtime.
 
@@ -217,7 +209,7 @@ Train e val provengono dal canonical train MedMNIST (immagini viste dal backbone
 
 ---
 
-### 6. `classical_baseline.py` — baseline di confronto
+### 5. `classical_baseline.py` — baseline di confronto
 
 MLP a un hidden layer (32 unità, ReLU, dropout 0.3), Adam (lr=0.01, weight_decay=1e-4), fino a 100 epoche con early stopping (patience 15) — su B1/B2/B3.
 
@@ -227,7 +219,7 @@ MLP a un hidden layer (32 unità, ReLU, dropout 0.3), Adam (lr=0.01, weight_deca
 
 ---
 
-### 7. `master_sweep_team_b.py` — ablation no-quantum + confronto compressori
+### 6. `master_sweep_team_b.py` — ablation no-quantum + confronto compressori
 
 Screening a tre vie (Logistic Regression, MLP a un hidden layer, RBF-SVM) su tutte le 36 combinazioni, con **selezione formale del comparatore primario** (solo validation, media su tutte le combinazioni e sui 3 seed) come richiesto dal documento.
 
@@ -245,7 +237,7 @@ Screening a tre vie (Logistic Regression, MLP a un hidden layer, RBF-SVM) su tut
 
 ---
 
-### 8. `week8_evaluation.py`
+### 7. `week8_evaluation.py`
 
 Valuta il VQC **specifico per compressore** (checkpoint di `train_vqc_production.py`) su tutti e tre gli split (train/val/test), su feature pulite — nessuna perturbazione, nessun backbone live. Non richiede modifiche di codice quando cambia `train_vqc_production.py`: importa `N_QUBITS`, `N_CLASSES`, `N_LAYERS`, `COMPRESSOR_PATHS`, `apply_scaler`, `pad_features` in diretta — i valori aggiornati si propagano automaticamente. Va solo **rieseguito** dopo ogni run di `train_vqc_production.py` che cambi i checkpoint.
 
@@ -255,7 +247,7 @@ Valuta il VQC **specifico per compressore** (checkpoint di `train_vqc_production
 
 ---
 
-### 9. `execute_week_7.py`
+### 8. `execute_week_7.py`
 
 Sweep few-shot: LogisticRegression + VQC su frazioni decrescenti del training set (25%, 10%, 5%), per B1/B2/B3, `D=[8,4]`, seed=`[11]` (seed=23 nel documento è un refuso confermato dal docente).
 
@@ -267,7 +259,7 @@ Riusa **direttamente** i building block di `train_vqc_production.py` (`QuantumPi
 
 ---
 
-### 10. `week4_sweep_production.py` — indipendente
+### 9. `week4_sweep_production.py` — indipendente
 
 Addestra `StabilizedVQC` con Adam (backpropagation diretta, nessun re-uploading) su feature **B1** soltanto. Indipendente dal resto della pipeline — il suo checkpoint non è consumato da nessun altro script. Eseguire solo se richiesto come deliverable a sé stante.
 
