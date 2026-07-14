@@ -47,8 +47,7 @@ L'architettura attuale è il punto di arrivo di un percorso di verifica rispetto
 3. **Pesi ansatz indipendenti per ciclo** — una variante a pesi condivisi tra cicli (schema Pérez-Salinas et al.) è stata testata, verificata tecnicamente corretta ma empiricamente peggiore, e scartata.
 4. **Scaler fittato solo su train** — sostituisce un primo scaling per-campione, non conforme al principio "fit solo su train" richiesto dal documento.
 5. **NFT al posto di Adam** — deviazione esplicitamente giustificata dalla clausola di flessibilità sugli iperparametri del documento, con evidenza di convergenza documentata.
-6. **Range di scaling angolare fissato a `[0, π]`** — decisione finale. Il documento indica `[0, 2π]`; con un singolo `RY(θ)` l'expectation value `⟨Z⟩ = cos(θ)` non è iniettivo su `[0, 2π]` (dimostrazione diretta: `θ=0.5` e `θ=2π−0.5` producono lo stesso `⟨Z⟩`), e il crollo empirico osservato con `2π` (25-30 punti di macro-F1 su tutti i compressori) ha confermato il problema.
-7. **Budget di entangling interpretato per singolo blocco ansatz, non sull'intero circuito** — decisione finale, unica lettura coerente col re-uploading obbligatorio.
+6. **Budget di entangling interpretato per singolo blocco ansatz, non sull'intero circuito** — decisione finale, unica lettura coerente col re-uploading obbligatorio.
 
 ---
 
