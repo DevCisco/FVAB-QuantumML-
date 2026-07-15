@@ -20,8 +20,8 @@ class DirectVQC(nn.Module):
     Layer quantistico che chiama EstimatorV2 direttamente, senza
     EstimatorQNN né TorchConnector.
 
-    I pesi variazionali sono un nn.Parameter standard: SPSA li legge e
-    li imposta tramite get_flat_params/set_flat_params come qualsiasi
+    I pesi variazionali sono un nn.Parameter standard: per future modifiche con QN-SPSA 
+    esso li legge e li imposta tramite get_flat_params/set_flat_params come qualsiasi
     altro parametro PyTorch.
 
     Il forward è una funzione numpy pura wrappata in
